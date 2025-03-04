@@ -3,6 +3,7 @@ package mocks
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"regexp"
 	"testing"
@@ -251,11 +252,32 @@ func (m *MockAutheliaCtx) Close() {
 	m.Ctrl.Finish()
 }
 
+func (m *MockAutheliaCtx) SetLogLevel(level logrus.Level) {
+	logger := logrus.New()
+	logger.Out = io.Discard
+	logger.SetLevel(level)
+
+	m.Hook = test.NewLocal(logger)
+	m.Ctx.Logger = logrus.NewEntry(logger)
+}
+
 // SetRequestBody set the request body from a struct with json tags.
 func (m *MockAutheliaCtx) SetRequestBody(t *testing.T, body interface{}) {
 	bodyBytes, err := json.Marshal(body)
 	require.NoError(t, err)
 	m.Ctx.Request.SetBody(bodyBytes)
+}
+
+func (m *MockAutheliaCtx) LogEntryN(i int) *logrus.Entry {
+	entries := m.Hook.AllEntries()
+
+	n := len(entries) - (1 + i)
+
+	if n < 0 {
+		return nil
+	}
+
+	return entries[n]
 }
 
 // AssertKO assert an error response from the service.
