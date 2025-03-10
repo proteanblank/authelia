@@ -2,7 +2,7 @@
 title: "Attributes"
 description: "This guide highlights information about attributes available via various methods"
 summary: "This guide highlights information about attributes available via various methods."
-date: 2025-02-22T16:18:09+11:00
+date: 2025-02-22T06:40:08+00:00
 draft: false
 images: []
 weight: 220
@@ -18,7 +18,7 @@ Authelia has three primary methods of deriving attributes:
 
 1. Standard Attributes derived directly from the authentication backend.
 2. Extra Attributes which are manually configured but still derived from the authentication backend.
-3. Custom Attributes derived from the other available attribute sources using the [Common Expression Language].
+3. Custom Attributes derived from the other available attribute sources using the [Common Expression Language](https://github.com/google/cel-spec).
 
 ## Standard Attributes
 

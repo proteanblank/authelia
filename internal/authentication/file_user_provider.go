@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,7 +26,7 @@ type FileUserProvider struct {
 	config        *schema.AuthenticationBackendFile
 	hash          algorithm.Hash
 	database      FileUserProviderDatabase
-	mutex         *sync.Mutex
+	mutex         sync.Mutex
 	timeoutReload time.Time
 }
 
@@ -33,7 +34,6 @@ type FileUserProvider struct {
 func NewFileUserProvider(config *schema.AuthenticationBackendFile) (provider *FileUserProvider) {
 	return &FileUserProvider{
 		config:        config,
-		mutex:         &sync.Mutex{},
 		timeoutReload: time.Now().Add(-1 * time.Second),
 		database:      NewFileUserDatabase(config.Path, config.Search.Email, config.Search.CaseInsensitive, getExtra(config)),
 	}
@@ -75,6 +75,10 @@ func (p *FileUserProvider) Reload() (reloaded bool, err error) {
 	p.setTimeoutReload(now)
 
 	return true, nil
+}
+
+func (p *FileUserProvider) Close() (err error) {
+	return nil
 }
 
 // CheckUserPassword checks if provided password matches for the given user.
@@ -151,6 +155,58 @@ func (p *FileUserProvider) UpdatePassword(username string, newPassword string) (
 
 	if err = p.database.Save(); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (p *FileUserProvider) ChangePassword(username string, oldPassword string, newPassword string) (err error) {
+	var details FileUserDatabaseUserDetails
+
+	if details, err = p.database.GetUserDetails(username); err != nil {
+		return fmt.Errorf("%w : %v", ErrUserNotFound, err)
+	}
+
+	if details.Disabled {
+		return ErrUserNotFound
+	}
+
+	if strings.TrimSpace(newPassword) == "" {
+		return ErrPasswordWeak
+	}
+
+	if oldPassword == newPassword {
+		return ErrPasswordWeak
+	}
+
+	oldPasswordCorrect, err := p.CheckUserPassword(username, oldPassword)
+
+	if err != nil {
+		return ErrAuthenticationFailed
+	}
+
+	if !oldPasswordCorrect {
+		return ErrIncorrectPassword
+	}
+
+	var digest algorithm.Digest
+
+	if digest, err = p.hash.Hash(newPassword); err != nil {
+		return fmt.Errorf("%w : %v", ErrOperationFailed, err)
+	}
+
+	details.Password = schema.NewPasswordDigest(digest)
+
+	p.database.SetUserDetails(details.Username, &details)
+
+	p.mutex.Lock()
+
+	p.setTimeoutReload(time.Now())
+
+	p.mutex.Unlock()
+
+	if err = p.database.Save(); err != nil {
+		return fmt.Errorf("%w : %v", ErrOperationFailed, err)
 	}
 
 	return nil
