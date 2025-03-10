@@ -8,13 +8,19 @@ import (
 
 // AuthenticationBackend represents the configuration related to the authentication backend.
 type AuthenticationBackend struct {
-	PasswordReset AuthenticationBackendPasswordReset `koanf:"password_reset" json:"password_reset" jsonschema:"title=Password Reset" jsonschema_description:"Allows configuration of the password reset behaviour."`
+	PasswordReset  AuthenticationBackendPasswordReset  `koanf:"password_reset" json:"password_reset" jsonschema:"title=Password Reset" jsonschema_description:"Allows configuration of the password reset behaviour."`
+	PasswordChange AuthenticationBackendPasswordChange `koanf:"password_change" json:"password_change" jsonschema:"title=Password Reset" jsonschema_description:"Allows configuration of the password reset behaviour."`
 
 	RefreshInterval RefreshIntervalDuration `koanf:"refresh_interval" json:"refresh_interval" jsonschema:"default=5 minutes,title=Refresh Interval" jsonschema_description:"How frequently the user details are refreshed from the backend."`
 
 	// The file authentication backend configuration.
 	File *AuthenticationBackendFile `koanf:"file" json:"file" jsonschema:"title=File Backend" jsonschema_description:"The file authentication backend configuration."`
 	LDAP *AuthenticationBackendLDAP `koanf:"ldap" json:"ldap" jsonschema:"title=LDAP Backend" jsonschema_description:"The LDAP authentication backend configuration."`
+}
+
+// AuthenticationBackendPasswordChange represents the configuration related to password reset functionality.
+type AuthenticationBackendPasswordChange struct {
+	Disable bool `koanf:"disable" json:"disable" jsonschema:"default=false,title=Disable" jsonschema_description:"Disables the Password Change option."`
 }
 
 // AuthenticationBackendPasswordReset represents the configuration related to password reset functionality.
@@ -123,9 +129,11 @@ type AuthenticationBackendFilePasswordSCrypt struct {
 type AuthenticationBackendLDAP struct {
 	Address        *AddressLDAP  `koanf:"address" json:"address" jsonschema:"title=Address" jsonschema_description:"The address of the LDAP directory server."`
 	Implementation string        `koanf:"implementation" json:"implementation" jsonschema:"default=custom,enum=custom,enum=activedirectory,enum=rfc2307bis,enum=freeipa,enum=lldap,enum=glauth,title=Implementation" jsonschema_description:"The implementation which mostly decides the default values."`
-	Timeout        time.Duration `koanf:"timeout" json:"timeout" jsonschema:"default=5 seconds,title=Timeout" jsonschema_description:"The LDAP directory server connection timeout."`
+	Timeout        time.Duration `koanf:"timeout" json:"timeout" jsonschema:"default=20 seconds,title=Timeout" jsonschema_description:"The LDAP directory server connection timeout."`
 	StartTLS       bool          `koanf:"start_tls" json:"start_tls" jsonschema:"default=false,title=StartTLS" jsonschema_description:"Enables the use of StartTLS."`
 	TLS            *TLS          `koanf:"tls" json:"tls" jsonschema:"title=TLS" jsonschema_description:"The LDAP directory server TLS connection properties."`
+
+	Pooling AuthenticationBackendLDAPPooling `koanf:"pooling" json:"pooling" jsonschema:"title=Pooling" jsonschema_description:"The LDAP Connection Pooling properties."`
 
 	BaseDN string `koanf:"base_dn" json:"base_dn" jsonschema:"title=Base DN" jsonschema_description:"The base for all directory server operations."`
 
@@ -134,7 +142,7 @@ type AuthenticationBackendLDAP struct {
 
 	AdditionalGroupsDN string `koanf:"additional_groups_dn" json:"additional_groups_dn" jsonschema:"title=Additional Group Base" jsonschema_description:"The base in addition to the Base DN for all directory server operations for groups."`
 	GroupsFilter       string `koanf:"groups_filter" json:"groups_filter" jsonschema:"title=Groups Filter" jsonschema_description:"The LDAP filter used to search for group objects."`
-	GroupSearchMode    string `koanf:"group_search_mode" json:"group_search_mode" jsonschema:"default=filter,enum=filter,enum=memberof,title=Groups Search Mode" jsonschema_description:"The LDAP group search mode used to search for group objects."`
+	GroupSearchMode    string `koanf:"group_search_mode" json:"group_search_mode" jsonschema:"default=filter,enum=filter,enum=memberof,title=Groups Search Modes" jsonschema_description:"The LDAP group search mode used to search for group objects."`
 
 	Attributes AuthenticationBackendLDAPAttributes `koanf:"attributes" json:"attributes"`
 
@@ -144,6 +152,13 @@ type AuthenticationBackendLDAP struct {
 
 	User     string `koanf:"user" json:"user" jsonschema:"title=User" jsonschema_description:"The user distinguished name for LDAP binding."`
 	Password string `koanf:"password" json:"password" jsonschema:"title=Password" jsonschema_description:"The password for LDAP authenticated binding."`
+}
+
+type AuthenticationBackendLDAPPooling struct {
+	Enable  bool          `koanf:"enable" json:"enable" jsonschema:"title=Enable,default=false" jsonschema_description:"Enable LDAP connection pooling."`
+	Count   int           `koanf:"count" json:"count" jsonschema:"title=Count,default=5" jsonschema_description:"The number of connections to keep open for LDAP connection pooling."`
+	Retries int           `koanf:"retries" json:"retries" jsonschema:"title=Retries,default=2" jsonschema_description:"The number of attempts to retrieve a connection from the pool during the timeout."`
+	Timeout time.Duration `koanf:"timeout" json:"timeout" jsonschema:"title=Timeout,default=10 seconds" jsonschema_description:"The duration of time to wait for a connection to become available in the connection pool."`
 }
 
 // AuthenticationBackendLDAPAttributes represents the configuration related to LDAP server attributes.
@@ -242,7 +257,12 @@ var DefaultLDAPAuthenticationBackendConfigurationImplementationCustom = Authenti
 		Mail:        ldapAttrMail,
 		GroupName:   ldapAttrCommonName,
 	},
-	Timeout: time.Second * 5,
+	Timeout: time.Second * 20,
+	Pooling: AuthenticationBackendLDAPPooling{
+		Count:   5,
+		Retries: 2,
+		Timeout: time.Second * 10,
+	},
 	TLS: &TLS{
 		MinimumVersion: TLSVersion{tls.VersionTLS12},
 	},

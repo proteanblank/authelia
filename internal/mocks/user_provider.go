@@ -40,6 +40,20 @@ func (m *MockUserProvider) EXPECT() *MockUserProviderMockRecorder {
 	return m.recorder
 }
 
+// ChangePassword mocks base method.
+func (m *MockUserProvider) ChangePassword(arg0, arg1, arg2 string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ChangePassword", arg0, arg1, arg2)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ChangePassword indicates an expected call of ChangePassword.
+func (mr *MockUserProviderMockRecorder) ChangePassword(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ChangePassword", reflect.TypeOf((*MockUserProvider)(nil).ChangePassword), arg0, arg1, arg2)
+}
+
 // CheckUserPassword mocks base method.
 func (m *MockUserProvider) CheckUserPassword(username, password string) (bool, error) {
 	m.ctrl.T.Helper()
@@ -53,6 +67,20 @@ func (m *MockUserProvider) CheckUserPassword(username, password string) (bool, e
 func (mr *MockUserProviderMockRecorder) CheckUserPassword(username, password any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CheckUserPassword", reflect.TypeOf((*MockUserProvider)(nil).CheckUserPassword), username, password)
+}
+
+// Close mocks base method.
+func (m *MockUserProvider) Close() error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Close")
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Close indicates an expected call of Close.
+func (mr *MockUserProviderMockRecorder) Close() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Close", reflect.TypeOf((*MockUserProvider)(nil).Close))
 }
 
 // GetDetails mocks base method.

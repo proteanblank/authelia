@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
+	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -25,42 +27,38 @@ func TestNewLDAPUserProvider(t *testing.T) {
 	assert.NotNil(t, provider)
 }
 
-func TestNewLDAPUserProviderWithFactoryWithoutFactory(t *testing.T) {
-	provider := NewLDAPUserProviderWithFactory(schema.AuthenticationBackendLDAP{}, false, nil, nil)
-
-	assert.NotNil(t, provider)
-
-	assert.IsType(t, &ProductionLDAPClientFactory{}, provider.factory)
-}
-
 func TestShouldCreateRawConnectionWhenSchemeIsLDAP(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Timeout:  time.Second * 20,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
 	mockClient := NewMockLDAPClient(ctrl)
 
 	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-		},
+		config,
 		false,
-		nil,
-		mockFactory)
+		factory)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURL := mockDialer.EXPECT().DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).Return(mockClient, nil)
 
-	connBind := mockClient.EXPECT().
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 20))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	gomock.InOrder(dialURL, connBind)
+	gomock.InOrder(dialURL, setTimeout, clientBind)
 
-	_, err := provider.connect()
+	_, err := provider.factory.GetClient()
 
 	require.NoError(t, err)
 }
@@ -69,30 +67,31 @@ func TestShouldCreateTLSConnectionWhenSchemeIsLDAPS(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPSAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPSAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-		},
-		false,
-		nil,
-		mockFactory)
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldaps://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURL := mockDialer.EXPECT().DialURL("ldaps://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBind := mockClient.EXPECT().
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	gomock.InOrder(dialURL, connBind)
+	gomock.InOrder(dialURL, setTimeout, clientBind)
 
-	_, err := provider.connect()
+	_, err := provider.factory.GetClient()
 
 	require.NoError(t, err)
 }
@@ -120,16 +119,16 @@ func TestEscapeSpecialCharsInGroupsFilter(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:      testLDAPSAddress,
+		GroupsFilter: "(|(member={dn})(uid={username})(uid={input}))",
+	}
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:      testLDAPSAddress,
-			GroupsFilter: "(|(member={dn})(uid={username})(uid={input}))",
-		},
-		false,
-		nil,
-		mockFactory)
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
+
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
 
 	profile := ldapUserProfile{
 		DN:          "cn=john (external),dc=example,dc=com",
@@ -149,7 +148,15 @@ func TestResolveGroupsFilter(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPSAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
 
 	testCases := []struct {
 		name     string
@@ -207,11 +214,7 @@ func TestResolveGroupsFilter(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			provider := NewLDAPUserProviderWithFactory(
-				tc.have,
-				false,
-				nil,
-				mockFactory)
+			provider := NewLDAPUserProviderWithFactory(&tc.have, false, factory)
 
 			assert.Equal(t, tc.expected, provider.resolveGroupsFilter("", tc.profile))
 		})
@@ -305,13 +308,12 @@ func TestShouldCheckLDAPEpochFilters(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			provider := NewLDAPUserProviderWithFactory(
-				schema.AuthenticationBackendLDAP{
+				&schema.AuthenticationBackendLDAP{
 					UsersFilter: tc.have.users,
 					Attributes:  tc.have.attr,
 					BaseDN:      "dc=example,dc=com",
 				},
 				false,
-				nil,
 				mockFactory)
 
 			assert.Equal(t, tc.expected.dtgeneralized, provider.usersFilterReplacementDateTimeGeneralized)
@@ -325,33 +327,34 @@ func TestShouldCheckLDAPServerExtensions(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:     testLDAPAddress,
-			User:        "cn=admin,dc=example,dc=com",
-			UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			Password:          "password",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBind := mockClient.EXPECT().
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -375,9 +378,9 @@ func TestShouldCheckLDAPServerExtensions(t *testing.T) {
 			},
 		}, nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
-	gomock.InOrder(dialURL, connBind, searchOIDs, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchOIDs, clientClose)
 
 	err := provider.StartupCheck()
 	assert.NoError(t, err)
@@ -389,37 +392,116 @@ func TestShouldCheckLDAPServerExtensions(t *testing.T) {
 	assert.False(t, provider.features.ControlTypes.MsftPwdPolHintsDeprecated)
 }
 
+func TestShouldCheckLDAPServerExtensionsPooled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		Pooling: schema.AuthenticationBackendLDAPPooling{
+			Count: 1,
+		},
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	factory := NewPooledLDAPClientFactory(config, nil, mockDialer)
+
+	mockClient := NewMockLDAPClient(ctrl)
+
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
+
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBind := mockClient.EXPECT().
+		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
+		Return(nil)
+
+	searchOIDs := mockClient.EXPECT().
+		Search(NewExtendedSearchRequestMatcher("(objectClass=*)", "", ldap.ScopeBaseObject, ldap.NeverDerefAliases, false, []string{ldapSupportedExtensionAttribute, ldapSupportedControlAttribute})).
+		Return(&ldap.SearchResult{
+			Entries: []*ldap.Entry{
+				{
+					DN: "",
+					Attributes: []*ldap.EntryAttribute{
+						{
+							Name:   ldapSupportedExtensionAttribute,
+							Values: []string{ldapOIDExtensionPwdModifyExOp, ldapOIDExtensionTLS},
+						},
+						{
+							Name:   ldapSupportedControlAttribute,
+							Values: []string{},
+						},
+					},
+				},
+			},
+		}, nil)
+
+	gomock.InOrder(
+		dialURL,
+		setTimeout,
+		clientBind,
+		mockClient.EXPECT().IsClosing().Return(false),
+		searchOIDs,
+		mockClient.EXPECT().IsClosing().Return(false),
+		mockClient.EXPECT().Close().Return(fmt.Errorf("close error")),
+	)
+
+	err := provider.StartupCheck()
+	assert.NoError(t, err)
+
+	assert.True(t, provider.features.Extensions.PwdModifyExOp)
+	assert.True(t, provider.features.Extensions.TLS)
+
+	assert.False(t, provider.features.ControlTypes.MsftPwdPolHints)
+	assert.False(t, provider.features.ControlTypes.MsftPwdPolHintsDeprecated)
+
+	assert.EqualError(t, provider.Close(), "errors occurred closing the client pool: close error")
+}
+
 func TestShouldNotCheckLDAPServerExtensionsWhenRootDSEReturnsMoreThanOneEntry(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:     testLDAPAddress,
-			User:        "cn=admin,dc=example,dc=com",
-			UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			Password:          "password",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -444,9 +526,9 @@ func TestShouldNotCheckLDAPServerExtensionsWhenRootDSEReturnsMoreThanOneEntry(t 
 			},
 		}, nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
-	gomock.InOrder(dialURL, connBind, searchOIDs, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchOIDs, clientClose)
 
 	err := provider.StartupCheck()
 	assert.NoError(t, err)
@@ -458,37 +540,202 @@ func TestShouldNotCheckLDAPServerExtensionsWhenRootDSEReturnsMoreThanOneEntry(t 
 	assert.False(t, provider.features.ControlTypes.MsftPwdPolHintsDeprecated)
 }
 
+func TestShouldNotCheckLDAPServerExtensionsWhenRootDSEReturnsMoreThanOneEntryPooled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		Pooling:           schema.AuthenticationBackendLDAPPooling{Count: 1},
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	mockClient := NewMockLDAPClient(ctrl)
+
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewPooledLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
+		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
+		Return(nil)
+
+	searchOIDs := mockClient.EXPECT().
+		Search(NewExtendedSearchRequestMatcher("(objectClass=*)", "", ldap.ScopeBaseObject, ldap.NeverDerefAliases, false, []string{ldapSupportedExtensionAttribute, ldapSupportedControlAttribute})).
+		Return(&ldap.SearchResult{
+			Entries: []*ldap.Entry{
+				{
+					DN: "",
+					Attributes: []*ldap.EntryAttribute{
+						{
+							Name:   ldapSupportedExtensionAttribute,
+							Values: []string{ldapOIDExtensionPwdModifyExOp, ldapOIDExtensionTLS},
+						},
+						{
+							Name:   ldapSupportedControlAttribute,
+							Values: []string{},
+						},
+					},
+				},
+				{},
+			},
+		}, nil)
+
+	gomock.InOrder(
+		dialURL,
+		setTimeout,
+		clientBind,
+		mockClient.EXPECT().IsClosing().Return(false),
+		searchOIDs,
+		mockClient.EXPECT().IsClosing().Return(false),
+		mockClient.EXPECT().Close().Return(nil),
+	)
+
+	err := provider.StartupCheck()
+	assert.NoError(t, err)
+
+	assert.False(t, provider.features.Extensions.PwdModifyExOp)
+	assert.False(t, provider.features.Extensions.TLS)
+
+	assert.False(t, provider.features.ControlTypes.MsftPwdPolHints)
+	assert.False(t, provider.features.ControlTypes.MsftPwdPolHintsDeprecated)
+
+	assert.NoError(t, provider.Close())
+}
+
+func TestShouldNotCheckLDAPServerExtensionsWhenRootDSEReturnsMoreThanOneEntryPooledClosing(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		Pooling:           schema.AuthenticationBackendLDAPPooling{Count: 1},
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	mockClient := NewMockLDAPClient(ctrl)
+	mockClientSecond := NewMockLDAPClient(ctrl)
+
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	dialURLSecond := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClientSecond, nil)
+
+	setTimeoutSecond := mockClientSecond.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewPooledLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
+		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
+		Return(nil)
+
+	clientBindSecond := mockClientSecond.EXPECT().
+		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
+		Return(nil)
+
+	searchOIDs := mockClientSecond.EXPECT().
+		Search(NewExtendedSearchRequestMatcher("(objectClass=*)", "", ldap.ScopeBaseObject, ldap.NeverDerefAliases, false, []string{ldapSupportedExtensionAttribute, ldapSupportedControlAttribute})).
+		Return(&ldap.SearchResult{
+			Entries: []*ldap.Entry{
+				{
+					DN: "",
+					Attributes: []*ldap.EntryAttribute{
+						{
+							Name:   ldapSupportedExtensionAttribute,
+							Values: []string{ldapOIDExtensionPwdModifyExOp, ldapOIDExtensionTLS},
+						},
+						{
+							Name:   ldapSupportedControlAttribute,
+							Values: []string{},
+						},
+					},
+				},
+				{},
+			},
+		}, nil)
+
+	gomock.InOrder(
+		dialURL,
+		setTimeout,
+		clientBind,
+		mockClient.EXPECT().IsClosing().Return(true),
+		dialURLSecond,
+		setTimeoutSecond,
+		clientBindSecond,
+		searchOIDs,
+		mockClientSecond.EXPECT().IsClosing().Return(false),
+		mockClientSecond.EXPECT().Close().Return(nil),
+	)
+
+	err := provider.StartupCheck()
+	assert.NoError(t, err)
+
+	assert.False(t, provider.features.Extensions.PwdModifyExOp)
+	assert.False(t, provider.features.Extensions.TLS)
+
+	assert.False(t, provider.features.ControlTypes.MsftPwdPolHints)
+	assert.False(t, provider.features.ControlTypes.MsftPwdPolHintsDeprecated)
+
+	assert.NoError(t, provider.Close())
+}
+
 func TestShouldCheckLDAPServerControlTypes(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:     testLDAPAddress,
-			User:        "cn=admin,dc=example,dc=com",
-			UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			Password:          "password",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -512,9 +759,9 @@ func TestShouldCheckLDAPServerControlTypes(t *testing.T) {
 			},
 		}, nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
-	gomock.InOrder(dialURL, connBind, searchOIDs, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchOIDs, clientClose)
 
 	err := provider.StartupCheck()
 	assert.NoError(t, err)
@@ -526,37 +773,114 @@ func TestShouldCheckLDAPServerControlTypes(t *testing.T) {
 	assert.True(t, provider.features.ControlTypes.MsftPwdPolHintsDeprecated)
 }
 
+func TestShouldCheckLDAPServerControlTypesPooled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		Pooling:           schema.AuthenticationBackendLDAPPooling{Count: 1},
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	mockClient := NewMockLDAPClient(ctrl)
+
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewPooledLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
+		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
+		Return(nil)
+
+	searchOIDs := mockClient.EXPECT().
+		Search(NewExtendedSearchRequestMatcher("(objectClass=*)", "", ldap.ScopeBaseObject, ldap.NeverDerefAliases, false, []string{ldapSupportedExtensionAttribute, ldapSupportedControlAttribute})).
+		Return(&ldap.SearchResult{
+			Entries: []*ldap.Entry{
+				{
+					DN: "",
+					Attributes: []*ldap.EntryAttribute{
+						{
+							Name:   ldapSupportedExtensionAttribute,
+							Values: []string{},
+						},
+						{
+							Name:   ldapSupportedControlAttribute,
+							Values: []string{ldapOIDControlMsftServerPolicyHints, ldapOIDControlMsftServerPolicyHintsDeprecated},
+						},
+					},
+				},
+			},
+		}, nil)
+
+	clientClose := mockClient.EXPECT().Close()
+
+	gomock.InOrder(
+		dialURL,
+		setTimeout,
+		clientBind,
+		mockClient.EXPECT().IsClosing().Return(false),
+		searchOIDs,
+		mockClient.EXPECT().IsClosing().Return(false),
+		clientClose,
+	)
+
+	err := provider.StartupCheck()
+	assert.NoError(t, err)
+
+	assert.False(t, provider.features.Extensions.PwdModifyExOp)
+	assert.False(t, provider.features.Extensions.TLS)
+
+	assert.True(t, provider.features.ControlTypes.MsftPwdPolHints)
+	assert.True(t, provider.features.ControlTypes.MsftPwdPolHintsDeprecated)
+
+	assert.NoError(t, provider.Close())
+}
+
 func TestShouldNotEnablePasswdModifyExtensionOrControlTypes(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:     testLDAPAddress,
-			User:        "cn=admin,dc=example,dc=com",
-			UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			Password:          "password",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -580,52 +904,126 @@ func TestShouldNotEnablePasswdModifyExtensionOrControlTypes(t *testing.T) {
 			},
 		}, nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
-	gomock.InOrder(dialURL, connBind, searchOIDs, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchOIDs, clientClose)
 
-	err := provider.StartupCheck()
-	assert.NoError(t, err)
+	assert.NoError(t, provider.StartupCheck())
 
 	assert.False(t, provider.features.Extensions.PwdModifyExOp)
 	assert.False(t, provider.features.Extensions.TLS)
 
 	assert.False(t, provider.features.ControlTypes.MsftPwdPolHints)
 	assert.False(t, provider.features.ControlTypes.MsftPwdPolHintsDeprecated)
+
+	assert.NoError(t, provider.Close())
+}
+
+func TestShouldNotEnablePasswdModifyExtensionOrControlTypesPooled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		Pooling: schema.AuthenticationBackendLDAPPooling{
+			Count: 1,
+		},
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	mockClient := NewMockLDAPClient(ctrl)
+
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewPooledLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
+		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
+		Return(nil)
+
+	searchOIDs := mockClient.EXPECT().
+		Search(NewExtendedSearchRequestMatcher("(objectClass=*)", "", ldap.ScopeBaseObject, ldap.NeverDerefAliases, false, []string{ldapSupportedExtensionAttribute, ldapSupportedControlAttribute})).
+		Return(&ldap.SearchResult{
+			Entries: []*ldap.Entry{
+				{
+					DN: "",
+					Attributes: []*ldap.EntryAttribute{
+						{
+							Name:   ldapSupportedExtensionAttribute,
+							Values: []string{},
+						},
+						{
+							Name:   ldapSupportedControlAttribute,
+							Values: []string{},
+						},
+					},
+				},
+			},
+		}, nil)
+
+	clientClose := mockClient.EXPECT().Close()
+
+	gomock.InOrder(
+		dialURL,
+		setTimeout,
+		clientBind,
+		mockClient.EXPECT().IsClosing().Return(false),
+		searchOIDs,
+		mockClient.EXPECT().IsClosing().Return(false),
+		clientClose,
+	)
+
+	assert.NoError(t, provider.StartupCheck())
+
+	assert.False(t, provider.features.Extensions.PwdModifyExOp)
+	assert.False(t, provider.features.Extensions.TLS)
+
+	assert.False(t, provider.features.ControlTypes.MsftPwdPolHints)
+	assert.False(t, provider.features.ControlTypes.MsftPwdPolHintsDeprecated)
+
+	assert.NoError(t, provider.Close())
 }
 
 func TestShouldReturnCheckServerConnectError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
-	mockClient := NewMockLDAPClient(ctrl)
-
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:     testLDAPAddress,
-			User:        "cn=admin,dc=example,dc=com",
-			UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			Password:          "password",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
 		},
-		false,
-		nil,
-		mockFactory)
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
 
-	mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, errors.New("could not connect"))
+	mockDialer := NewMockLDAPClientDialer(ctrl)
 
-	err := provider.StartupCheck()
-	assert.EqualError(t, err, "dial failed with error: could not connect")
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(nil, errors.New("could not connect"))
+
+	assert.EqualError(t, provider.StartupCheck(), "error occurred dialing address: could not connect")
 
 	assert.False(t, provider.features.Extensions.PwdModifyExOp)
 }
@@ -634,33 +1032,32 @@ func TestShouldReturnCheckServerSearchError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:     testLDAPAddress,
-			User:        "cn=admin,dc=example,dc=com",
-			UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			Password:          "password",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -668,9 +1065,9 @@ func TestShouldReturnCheckServerSearchError(t *testing.T) {
 		Search(NewExtendedSearchRequestMatcher("(objectClass=*)", "", ldap.ScopeBaseObject, ldap.NeverDerefAliases, false, []string{ldapSupportedExtensionAttribute, ldapSupportedControlAttribute})).
 		Return(nil, errors.New("could not perform the search"))
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
-	gomock.InOrder(dialURL, connBind, searchOIDs, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchOIDs, clientClose)
 
 	err := provider.StartupCheck()
 	assert.EqualError(t, err, "error occurred during RootDSE search: could not perform the search")
@@ -678,38 +1075,37 @@ func TestShouldReturnCheckServerSearchError(t *testing.T) {
 	assert.False(t, provider.features.Extensions.PwdModifyExOp)
 }
 
-func TestShouldPermitRootDSEFailure(t *testing.T) {
+func TestShouldReturnCheckServerSearchErrorPooled(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:     testLDAPAddress,
+		User:        "cn=admin,dc=example,dc=com",
+		UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		Pooling:           schema.AuthenticationBackendLDAPPooling{Count: 1},
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			PermitFeatureDetectionFailure: true,
-			Address:                       testLDAPAddress,
-			User:                          "cn=admin,dc=example,dc=com",
-			UsersFilter:                   "(|({username_attribute}={input})({mail_attribute}={input}))",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			Password:          "password",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewPooledLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -717,12 +1113,124 @@ func TestShouldPermitRootDSEFailure(t *testing.T) {
 		Search(NewExtendedSearchRequestMatcher("(objectClass=*)", "", ldap.ScopeBaseObject, ldap.NeverDerefAliases, false, []string{ldapSupportedExtensionAttribute, ldapSupportedControlAttribute})).
 		Return(nil, errors.New("could not perform the search"))
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
-	gomock.InOrder(dialURL, connBind, searchOIDs, connClose)
+	gomock.InOrder(
+		dialURL,
+		setTimeout,
+		clientBind,
+		mockClient.EXPECT().IsClosing().Return(false),
+		searchOIDs,
+		mockClient.EXPECT().IsClosing().Return(false),
+		clientClose,
+	)
 
 	err := provider.StartupCheck()
-	assert.NoError(t, err)
+	assert.EqualError(t, err, "error occurred during RootDSE search: could not perform the search")
+
+	assert.False(t, provider.features.Extensions.PwdModifyExOp)
+
+	assert.NoError(t, provider.Close())
+}
+
+func TestShouldPermitRootDSEFailure(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	config := &schema.AuthenticationBackendLDAP{
+		PermitFeatureDetectionFailure: true,
+		Address:                       testLDAPAddress,
+		User:                          "cn=admin,dc=example,dc=com",
+		UsersFilter:                   "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	mockClient := NewMockLDAPClient(ctrl)
+
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
+		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
+		Return(nil)
+
+	searchOIDs := mockClient.EXPECT().
+		Search(NewExtendedSearchRequestMatcher("(objectClass=*)", "", ldap.ScopeBaseObject, ldap.NeverDerefAliases, false, []string{ldapSupportedExtensionAttribute, ldapSupportedControlAttribute})).
+		Return(nil, errors.New("could not perform the search"))
+
+	clientClose := mockClient.EXPECT().Close()
+
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchOIDs, clientClose)
+
+	assert.NoError(t, provider.StartupCheck())
+}
+
+func TestShouldPermitRootDSEFailurePooled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	config := &schema.AuthenticationBackendLDAP{
+		PermitFeatureDetectionFailure: true,
+		Address:                       testLDAPAddress,
+		User:                          "cn=admin,dc=example,dc=com",
+		UsersFilter:                   "(|({username_attribute}={input})({mail_attribute}={input}))",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		Password:          "password",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		Pooling:           schema.AuthenticationBackendLDAPPooling{Count: 1},
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	mockClient := NewMockLDAPClient(ctrl)
+
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewPooledLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
+		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
+		Return(nil)
+
+	searchOIDs := mockClient.EXPECT().
+		Search(NewExtendedSearchRequestMatcher("(objectClass=*)", "", ldap.ScopeBaseObject, ldap.NeverDerefAliases, false, []string{ldapSupportedExtensionAttribute, ldapSupportedControlAttribute})).
+		Return(nil, errors.New("could not perform the search"))
+
+	clientClose := mockClient.EXPECT().Close()
+
+	gomock.InOrder(
+		dialURL,
+		setTimeout,
+		clientBind,
+		mockClient.EXPECT().IsClosing().Return(false),
+		searchOIDs,
+		mockClient.EXPECT().IsClosing().Return(false),
+		clientClose,
+	)
+
+	assert.NoError(t, provider.StartupCheck())
+	assert.NoError(t, provider.Close())
 }
 
 type SearchRequestMatcher struct {
@@ -750,7 +1258,7 @@ func TestShouldEscapeUserInput(t *testing.T) {
 	mockClient := NewMockLDAPClient(ctrl)
 
 	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
+		&schema.AuthenticationBackendLDAP{
 			Address:     testLDAPAddress,
 			User:        "cn=admin,dc=example,dc=com",
 			UsersFilter: "(|({username_attribute}={input})({mail_attribute}={input}))",
@@ -766,7 +1274,6 @@ func TestShouldEscapeUserInput(t *testing.T) {
 			PermitReferrals:   true,
 		},
 		false,
-		nil,
 		mockFactory)
 
 	mockClient.EXPECT().
@@ -783,35 +1290,34 @@ func TestShouldReturnEmailWhenAttributeSameAsUsername(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "mail",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "(&({username_attribute}={input})(objectClass=inetOrgPerson))",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "mail",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "(&({username_attribute}={input})(objectClass=inetOrgPerson))",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	assert.Equal(t, []string{"mail", "displayName", "memberOf"}, provider.usersAttributes)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	bind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -835,9 +1341,9 @@ func TestShouldReturnEmailWhenAttributeSameAsUsername(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, bind, search)
+	gomock.InOrder(dialURL, setTimeout, clientBind, search)
 
-	client, err := provider.connect()
+	client, err := provider.factory.GetClient()
 	assert.NoError(t, err)
 
 	profile, err := provider.getUserProfile(client, "john@example.com")
@@ -857,35 +1363,34 @@ func TestShouldReturnUsernameAndBlankDisplayNameWhenAttributesTheSame(t *testing
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "uid",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "(&(|({username_attribute}={input})({mail_attribute}={input}))(objectClass=inetOrgPerson))",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "uid",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "(&(|({username_attribute}={input})({mail_attribute}={input}))(objectClass=inetOrgPerson))",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	assert.Equal(t, []string{"uid", "mail", "memberOf"}, provider.usersAttributes)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	bind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -909,9 +1414,9 @@ func TestShouldReturnUsernameAndBlankDisplayNameWhenAttributesTheSame(t *testing
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, bind, search)
+	gomock.InOrder(dialURL, setTimeout, clientBind, search)
 
-	client, err := provider.connect()
+	client, err := provider.factory.GetClient()
 	assert.NoError(t, err)
 
 	profile, err := provider.getUserProfile(client, "john@example.com")
@@ -931,35 +1436,34 @@ func TestShouldReturnBlankEmailAndDisplayNameWhenAttrsLenZero(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "(&(|({username_attribute}={input})({mail_attribute}={input}))(objectClass=inetOrgPerson))",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "(&(|({username_attribute}={input})({mail_attribute}={input}))(objectClass=inetOrgPerson))",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	assert.Equal(t, []string{"uid", "mail", "displayName", "memberOf"}, provider.usersAttributes)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	bind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -991,9 +1495,9 @@ func TestShouldReturnBlankEmailAndDisplayNameWhenAttrsLenZero(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, bind, search)
+	gomock.InOrder(dialURL, setTimeout, clientBind, search)
 
-	client, err := provider.connect()
+	client, err := provider.factory.GetClient()
 	assert.NoError(t, err)
 
 	profile, err := provider.getUserProfile(client, "john@example.com")
@@ -1016,7 +1520,7 @@ func TestShouldCombineUsernameFilterAndUsersFilter(t *testing.T) {
 	mockClient := NewMockLDAPClient(ctrl)
 
 	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
+		&schema.AuthenticationBackendLDAP{
 			Address:     testLDAPAddress,
 			User:        "cn=admin,dc=example,dc=com",
 			UsersFilter: "(&({username_attribute}={input})(&(objectCategory=person)(objectClass=user)))",
@@ -1032,7 +1536,6 @@ func TestShouldCombineUsernameFilterAndUsersFilter(t *testing.T) {
 			PermitReferrals:   true,
 		},
 		false,
-		nil,
 		mockFactory)
 
 	assert.Equal(t, []string{"uid", "mail", "displayName", "memberOf"}, provider.usersAttributes)
@@ -1092,39 +1595,38 @@ func TestShouldNotCrashWhenGroupsAreNotRetrievedFromLDAP(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchGroups := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -1154,7 +1656,7 @@ func TestShouldNotCrashWhenGroupsAreNotRetrievedFromLDAP(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -1169,101 +1671,104 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldPass(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
-	mockClient := NewMockLDAPClient(ctrl)
+	mockDialer := NewMockLDAPClientDialer(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:       "uid",
-				Mail:           "mail",
-				DisplayName:    "displayName",
-				MemberOf:       "memberOf",
-				StreetAddress:  "street",
-				FamilyName:     "sn",
-				MiddleName:     "middle",
-				GivenName:      "givenName",
-				Nickname:       "nickname",
-				Gender:         "gender",
-				Birthdate:      "birthDate",
-				Website:        "website",
-				Profile:        "profile",
-				Picture:        "picture",
-				ZoneInfo:       "zoneinfo",
-				Locale:         "locale",
-				PhoneNumber:    "phone",
-				PhoneExtension: "ext",
-				Locality:       "locality",
-				Region:         "region",
-				PostalCode:     "postCode",
-				Country:        "c",
-				Extra: map[string]schema.AuthenticationBackendLDAPAttributesAttribute{
-					"exampleStr": {
-						AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
-							MultiValued: false,
-							ValueType:   ValueTypeString,
-						},
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:       "uid",
+			Mail:           "mail",
+			DisplayName:    "displayName",
+			MemberOf:       "memberOf",
+			StreetAddress:  "street",
+			FamilyName:     "sn",
+			MiddleName:     "middle",
+			GivenName:      "givenName",
+			Nickname:       "nickname",
+			Gender:         "gender",
+			Birthdate:      "birthDate",
+			Website:        "website",
+			Profile:        "profile",
+			Picture:        "picture",
+			ZoneInfo:       "zoneinfo",
+			Locale:         "locale",
+			PhoneNumber:    "phone",
+			PhoneExtension: "ext",
+			Locality:       "locality",
+			Region:         "region",
+			PostalCode:     "postCode",
+			Country:        "c",
+			Extra: map[string]schema.AuthenticationBackendLDAPAttributesAttribute{
+				"exampleStr": {
+					AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
+						MultiValued: false,
+						ValueType:   ValueTypeString,
 					},
-					"exampleStrMV": {
-						AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
-							MultiValued: true,
-							ValueType:   ValueTypeString,
-						},
+				},
+				"exampleStrMV": {
+					AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
+						MultiValued: true,
+						ValueType:   ValueTypeString,
 					},
-					"exampleInt": {
-						Name: "exampleIntChangedAttributeName",
-						AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
-							MultiValued: false,
-							ValueType:   ValueTypeInteger,
-						},
+				},
+				"exampleInt": {
+					Name: "exampleIntChangedAttributeName",
+					AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
+						MultiValued: false,
+						ValueType:   ValueTypeInteger,
 					},
-					"exampleIntMV": {
-						AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
-							MultiValued: true,
-							ValueType:   ValueTypeInteger,
-						},
+				},
+				"exampleIntMV": {
+					AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
+						MultiValued: true,
+						ValueType:   ValueTypeInteger,
 					},
-					"exampleBool": {
-						AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
-							MultiValued: false,
-							ValueType:   ValueTypeBoolean,
-						},
+				},
+				"exampleBool": {
+					AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
+						MultiValued: false,
+						ValueType:   ValueTypeBoolean,
 					},
-					"exampleBoolMV": {
-						AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
-							MultiValued: true,
-							ValueType:   ValueTypeBoolean,
-						},
+				},
+				"exampleBoolMV": {
+					AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
+						MultiValued: true,
+						ValueType:   ValueTypeBoolean,
 					},
-					"exampleEmptyStringInt": {
-						AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
-							MultiValued: false,
-							ValueType:   ValueTypeInteger,
-						},
+				},
+				"exampleEmptyStringInt": {
+					AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
+						MultiValued: false,
+						ValueType:   ValueTypeInteger,
 					},
-					"exampleEmptyStringBoolean": {
-						AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
-							MultiValued: false,
-							ValueType:   ValueTypeBoolean,
-						},
+				},
+				"exampleEmptyStringBoolean": {
+					AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
+						MultiValued: false,
+						ValueType:   ValueTypeBoolean,
 					},
 				},
 			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
 		},
-		false,
-		nil,
-		mockFactory)
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
 
-	dialURL := mockFactory.EXPECT().
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
+
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
+
+	mockClient := NewMockLDAPClient(ctrl)
+
+	dialURL := mockDialer.EXPECT().
 		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
 		Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
 	connBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
@@ -1405,7 +1910,7 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldPass(t *testing.T) {
 
 	searchGroup := mockClient.EXPECT().Search(gomock.Any()).Return(createSearchResultWithAttributes(), nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroup, connClose)
+	gomock.InOrder(dialURL, setTimeout, connBind, searchProfile, searchGroup, connClose)
 
 	enAU := language.MustParse("en-AU")
 	website, _ := url.Parse("https://authelia.com")
@@ -1487,41 +1992,44 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldParseError(t *testing.T) {
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
 
-			mockFactory := NewMockLDAPClientFactory(ctrl)
-			mockClient := NewMockLDAPClient(ctrl)
+			mockDialer := NewMockLDAPClientDialer(ctrl)
 
-			provider := NewLDAPUserProviderWithFactory(
-				schema.AuthenticationBackendLDAP{
-					Address:  testLDAPAddress,
-					User:     "cn=admin,dc=example,dc=com",
-					Password: "password",
-					Attributes: schema.AuthenticationBackendLDAPAttributes{
-						Username:      "uid",
-						Mail:          "mail",
-						DisplayName:   "displayName",
-						MemberOf:      "memberOf",
-						StreetAddress: "street",
-						Extra: map[string]schema.AuthenticationBackendLDAPAttributesAttribute{
-							"example": {
-								AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
-									MultiValued: tc.multiValued,
-									ValueType:   tc.valueType,
-								},
+			config := &schema.AuthenticationBackendLDAP{
+				Address:  testLDAPAddress,
+				User:     "cn=admin,dc=example,dc=com",
+				Password: "password",
+				Attributes: schema.AuthenticationBackendLDAPAttributes{
+					Username:      "uid",
+					Mail:          "mail",
+					DisplayName:   "displayName",
+					MemberOf:      "memberOf",
+					StreetAddress: "street",
+					Extra: map[string]schema.AuthenticationBackendLDAPAttributesAttribute{
+						"example": {
+							AuthenticationBackendExtraAttribute: schema.AuthenticationBackendExtraAttribute{
+								MultiValued: tc.multiValued,
+								ValueType:   tc.valueType,
 							},
 						},
 					},
-					UsersFilter:       "uid={input}",
-					AdditionalUsersDN: "ou=users",
-					BaseDN:            "dc=example,dc=com",
-					PermitReferrals:   true,
 				},
-				false,
-				nil,
-				mockFactory)
+				UsersFilter:       "uid={input}",
+				AdditionalUsersDN: "ou=users",
+				BaseDN:            "dc=example,dc=com",
+				PermitReferrals:   true,
+			}
 
-			dialURL := mockFactory.EXPECT().
+			factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
+
+			provider := NewLDAPUserProviderWithFactory(config, false, factory)
+
+			mockClient := NewMockLDAPClient(ctrl)
+
+			dialURL := mockDialer.EXPECT().
 				DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
 				Return(mockClient, nil)
+
+			setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
 			connBind := mockClient.EXPECT().
 				Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
@@ -1565,7 +2073,7 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldParseError(t *testing.T) {
 					},
 				}, nil)
 
-			gomock.InOrder(dialURL, connBind, searchProfile, connClose)
+			gomock.InOrder(dialURL, setTimeout, connBind, searchProfile, connClose)
 
 			details, err := provider.GetDetailsExtended("john")
 			assert.Nil(t, details)
@@ -1578,33 +2086,36 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldErrorBadPictureURL(t *testing
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			Picture:     "photoURL",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
+
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				Picture:     "photoURL",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
-
-	dialURL := mockFactory.EXPECT().
+	dialURL := mockDialer.EXPECT().
 		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
 		Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
 	connBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
@@ -1646,7 +2157,7 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldErrorBadPictureURL(t *testing
 
 	searchGroup := mockClient.EXPECT().Search(gomock.Any()).Return(createSearchResultWithAttributes(), nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroup, connClose)
+	gomock.InOrder(dialURL, setTimeout, connBind, searchProfile, searchGroup, connClose)
 
 	details, err := provider.GetDetailsExtended("john")
 	assert.Nil(t, details)
@@ -1657,33 +2168,36 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldErrorBadProfileURL(t *testing
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			Profile:     "profile",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
+
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				Profile:     "profile",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
-
-	dialURL := mockFactory.EXPECT().
+	dialURL := mockDialer.EXPECT().
 		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
 		Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
 	connBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
@@ -1725,7 +2239,7 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldErrorBadProfileURL(t *testing
 
 	searchGroup := mockClient.EXPECT().Search(gomock.Any()).Return(createSearchResultWithAttributes(), nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroup, connClose)
+	gomock.InOrder(dialURL, setTimeout, connBind, searchProfile, searchGroup, connClose)
 
 	details, err := provider.GetDetailsExtended("john")
 	assert.Nil(t, details)
@@ -1736,33 +2250,36 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldErrorBadWebsiteURL(t *testing
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			Website:     "www",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
+
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				Website:     "www",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
-
-	dialURL := mockFactory.EXPECT().
+	dialURL := mockDialer.EXPECT().
 		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
 		Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
 	connBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
@@ -1804,7 +2321,7 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldErrorBadWebsiteURL(t *testing
 
 	searchGroup := mockClient.EXPECT().Search(gomock.Any()).Return(createSearchResultWithAttributes(), nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroup, connClose)
+	gomock.InOrder(dialURL, setTimeout, connBind, searchProfile, searchGroup, connClose)
 
 	details, err := provider.GetDetailsExtended("john")
 	assert.Nil(t, details)
@@ -1815,33 +2332,36 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldErrorBadLocale(t *testing.T) 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			Locale:      "locale",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
+
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				Locale:      "locale",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
-
-	dialURL := mockFactory.EXPECT().
+	dialURL := mockDialer.EXPECT().
 		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
 		Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
 	connBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
@@ -1883,7 +2403,7 @@ func TestLDAPUserProvider_GetDetailsExtended_ShouldErrorBadLocale(t *testing.T) 
 
 	searchGroup := mockClient.EXPECT().Search(gomock.Any()).Return(createSearchResultWithAttributes(), nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroup, connClose)
+	gomock.InOrder(dialURL, setTimeout, connBind, searchProfile, searchGroup, connClose)
 
 	details, err := provider.GetDetailsExtended("john")
 	assert.Nil(t, details)
@@ -1894,44 +2414,43 @@ func TestLDAPUserProvider_GetDetails_ShouldReturnOnUserError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
 		Return(nil, fmt.Errorf("failed to search"))
 
-	gomock.InOrder(dialURL, connBind, searchProfile, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, clientClose)
 
 	details, err := provider.GetDetails("john")
 	assert.Nil(t, details)
@@ -1942,32 +2461,35 @@ func TestLDAPUserProvider_GetDetailsExtendedShouldReturnOnBindError(t *testing.T
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
+
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
-
-	dialURL := mockFactory.EXPECT().
+	dialURL := mockDialer.EXPECT().
 		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
 		Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
 	connBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
@@ -1975,40 +2497,40 @@ func TestLDAPUserProvider_GetDetailsExtendedShouldReturnOnBindError(t *testing.T
 
 	connClose := mockClient.EXPECT().Close().Return(nil)
 
-	gomock.InOrder(dialURL, connBind, connClose)
+	gomock.InOrder(dialURL, setTimeout, connBind, connClose)
 
 	details, err := provider.GetDetailsExtended("john")
 	assert.Nil(t, details)
-	assert.EqualError(t, err, "bind failed with error: bad bind")
+	assert.EqualError(t, err, "error occurred performing bind: bad bind")
 }
 
 func TestLDAPUserProvider_GetDetailsExtendedShouldReturnOnDialError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	mockDialer := NewMockLDAPClientDialer(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
 		},
-		false,
-		nil,
-		mockFactory)
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
 
-	dialURL := mockFactory.EXPECT().
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
+
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
+
+	dialURL := mockDialer.EXPECT().
 		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
 		Return(nil, fmt.Errorf("failed to dial"))
 
@@ -2016,39 +2538,41 @@ func TestLDAPUserProvider_GetDetailsExtendedShouldReturnOnDialError(t *testing.T
 
 	details, err := provider.GetDetailsExtended("john")
 	assert.Nil(t, details)
-	assert.EqualError(t, err, "dial failed with error: failed to dial")
+	assert.EqualError(t, err, "error occurred dialing address: failed to dial")
 }
 
 func TestLDAPUserProvider_GetDetailsExtendedShouldReturnOnUserError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
+	factory := NewStandardLDAPClientFactory(config, nil, mockDialer)
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	provider := NewLDAPUserProviderWithFactory(config, false, factory)
 
-	dialURL := mockFactory.EXPECT().
+	dialURL := mockDialer.EXPECT().
 		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
 		Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
 	connBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
@@ -2060,7 +2584,7 @@ func TestLDAPUserProvider_GetDetailsExtendedShouldReturnOnUserError(t *testing.T
 		Search(gomock.Any()).
 		Return(nil, fmt.Errorf("failed to search"))
 
-	gomock.InOrder(dialURL, connBind, searchProfile, connClose)
+	gomock.InOrder(dialURL, setTimeout, connBind, searchProfile, connClose)
 
 	details, err := provider.GetDetailsExtended("john")
 	assert.Nil(t, details)
@@ -2071,38 +2595,37 @@ func TestLDAPUserProvider_GetDetails_ShouldReturnOnGroupsError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchGroups := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -2132,7 +2655,7 @@ func TestLDAPUserProvider_GetDetails_ShouldReturnOnGroupsError(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 
@@ -2144,37 +2667,36 @@ func TestShouldNotCrashWhenEmailsAreNotRetrievedFromLDAP(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "displayName",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "displayName",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchGroups := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -2196,7 +2718,7 @@ func TestShouldNotCrashWhenEmailsAreNotRetrievedFromLDAP(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -2210,37 +2732,36 @@ func TestShouldUnauthenticatedBind(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "displayName",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "displayName",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		UnauthenticatedBind(gomock.Eq("cn=admin,dc=example,dc=com")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchGroups := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -2262,7 +2783,7 @@ func TestShouldUnauthenticatedBind(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -2276,38 +2797,37 @@ func TestShouldReturnUsernameFromLDAP(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchGroups := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -2337,7 +2857,7 @@ func TestShouldReturnUsernameFromLDAP(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -2352,40 +2872,39 @@ func TestShouldReturnUsernameFromLDAPSearchModeMemberOfRDN(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		GroupSearchMode:   "memberof",
+		UsersFilter:       "uid={input}",
+		GroupsFilter:      "(|{memberof:rdn})",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "DC=example,DC=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			GroupSearchMode:   "memberof",
-			UsersFilter:       "uid={input}",
-			GroupsFilter:      "(|{memberof:rdn})",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "DC=example,DC=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	requestGroups := ldap.NewSearchRequest(
 		provider.groupsBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
@@ -2427,7 +2946,7 @@ func TestShouldReturnUsernameFromLDAPSearchModeMemberOfRDN(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -2442,41 +2961,40 @@ func TestShouldReturnUsernameFromLDAPSearchModeMemberOfDN(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "CN=Administrator,CN=Users,DC=example,DC=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			DistinguishedName: "distinguishedName",
+			Username:          "sAMAccountName",
+			Mail:              "mail",
+			DisplayName:       "displayName",
+			MemberOf:          "memberOf",
+			GroupName:         "cn",
+		},
+		GroupSearchMode:   "memberof",
+		UsersFilter:       "sAMAccountName={input}",
+		GroupsFilter:      "(|{memberof:dn})",
+		AdditionalUsersDN: "CN=users",
+		BaseDN:            "DC=example,DC=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "CN=Administrator,CN=Users,DC=example,DC=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				DistinguishedName: "distinguishedName",
-				Username:          "sAMAccountName",
-				Mail:              "mail",
-				DisplayName:       "displayName",
-				MemberOf:          "memberOf",
-				GroupName:         "cn",
-			},
-			GroupSearchMode:   "memberof",
-			UsersFilter:       "sAMAccountName={input}",
-			GroupsFilter:      "(|{memberof:dn})",
-			AdditionalUsersDN: "CN=users",
-			BaseDN:            "DC=example,DC=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("CN=Administrator,CN=Users,DC=example,DC=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	requestGroups := ldap.NewSearchRequest(
 		provider.groupsBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
@@ -2515,7 +3033,7 @@ func TestShouldReturnUsernameFromLDAPSearchModeMemberOfDN(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -2530,41 +3048,40 @@ func TestShouldReturnErrSearchMemberOf(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "CN=Administrator,CN=Users,DC=example,DC=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			DistinguishedName: "distinguishedName",
+			Username:          "sAMAccountName",
+			Mail:              "mail",
+			DisplayName:       "displayName",
+			MemberOf:          "memberOf",
+			GroupName:         "cn",
+		},
+		GroupSearchMode:   "memberof",
+		UsersFilter:       "sAMAccountName={input}",
+		GroupsFilter:      "(|{memberof:dn})",
+		AdditionalUsersDN: "CN=users",
+		BaseDN:            "DC=example,DC=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "CN=Administrator,CN=Users,DC=example,DC=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				DistinguishedName: "distinguishedName",
-				Username:          "sAMAccountName",
-				Mail:              "mail",
-				DisplayName:       "displayName",
-				MemberOf:          "memberOf",
-				GroupName:         "cn",
-			},
-			GroupSearchMode:   "memberof",
-			UsersFilter:       "sAMAccountName={input}",
-			GroupsFilter:      "(|{memberof:dn})",
-			AdditionalUsersDN: "CN=users",
-			BaseDN:            "DC=example,DC=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("CN=Administrator,CN=Users,DC=example,DC=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	requestGroups := ldap.NewSearchRequest(
 		provider.groupsBaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
@@ -2603,7 +3120,7 @@ func TestShouldReturnErrSearchMemberOf(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	assert.Nil(t, details)
@@ -2614,41 +3131,40 @@ func TestShouldReturnErrUnknownSearchMode(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "CN=Administrator,CN=Users,DC=example,DC=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			DistinguishedName: "distinguishedName",
+			Username:          "sAMAccountName",
+			Mail:              "mail",
+			DisplayName:       "displayName",
+			MemberOf:          "memberOf",
+			GroupName:         "cn",
+		},
+		GroupSearchMode:   "bad",
+		UsersFilter:       "sAMAccountName={input}",
+		GroupsFilter:      "(|{memberof:dn})",
+		AdditionalUsersDN: "CN=users",
+		BaseDN:            "DC=example,DC=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "CN=Administrator,CN=Users,DC=example,DC=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				DistinguishedName: "distinguishedName",
-				Username:          "sAMAccountName",
-				Mail:              "mail",
-				DisplayName:       "displayName",
-				MemberOf:          "memberOf",
-				GroupName:         "cn",
-			},
-			GroupSearchMode:   "bad",
-			UsersFilter:       "sAMAccountName={input}",
-			GroupsFilter:      "(|{memberof:dn})",
-			AdditionalUsersDN: "CN=users",
-			BaseDN:            "DC=example,DC=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("CN=Administrator,CN=Users,DC=example,DC=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -2678,7 +3194,7 @@ func TestShouldReturnErrUnknownSearchMode(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, clientClose)
 
 	details, err := provider.GetDetails("john")
 	assert.Nil(t, details)
@@ -2690,41 +3206,40 @@ func TestShouldSkipEmptyAttributesSearchModeMemberOf(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "CN=Administrator,CN=Users,DC=example,DC=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			DistinguishedName: "distinguishedName",
+			Username:          "sAMAccountName",
+			Mail:              "mail",
+			DisplayName:       "displayName",
+			MemberOf:          "memberOf",
+			GroupName:         "cn",
+		},
+		GroupSearchMode:   "memberof",
+		UsersFilter:       "sAMAccountName={input}",
+		GroupsFilter:      "(|{memberof:dn})",
+		AdditionalUsersDN: "CN=users",
+		BaseDN:            "DC=example,DC=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "CN=Administrator,CN=Users,DC=example,DC=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				DistinguishedName: "distinguishedName",
-				Username:          "sAMAccountName",
-				Mail:              "mail",
-				DisplayName:       "displayName",
-				MemberOf:          "memberOf",
-				GroupName:         "cn",
-			},
-			GroupSearchMode:   "memberof",
-			UsersFilter:       "sAMAccountName={input}",
-			GroupsFilter:      "(|{memberof:dn})",
-			AdditionalUsersDN: "CN=users",
-			BaseDN:            "DC=example,DC=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("CN=Administrator,CN=Users,DC=example,DC=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -2792,7 +3307,7 @@ func TestShouldSkipEmptyAttributesSearchModeMemberOf(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 
@@ -2804,41 +3319,40 @@ func TestShouldSkipEmptyAttributesSearchModeFilter(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "CN=Administrator,CN=Users,DC=example,DC=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			DistinguishedName: "distinguishedName",
+			Username:          "sAMAccountName",
+			Mail:              "mail",
+			DisplayName:       "displayName",
+			MemberOf:          "memberOf",
+			GroupName:         "cn",
+		},
+		GroupSearchMode:   "filter",
+		UsersFilter:       "sAMAccountName={input}",
+		GroupsFilter:      "(|{memberof:dn})",
+		AdditionalUsersDN: "CN=users",
+		BaseDN:            "DC=example,DC=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "CN=Administrator,CN=Users,DC=example,DC=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				DistinguishedName: "distinguishedName",
-				Username:          "sAMAccountName",
-				Mail:              "mail",
-				DisplayName:       "displayName",
-				MemberOf:          "memberOf",
-				GroupName:         "cn",
-			},
-			GroupSearchMode:   "filter",
-			UsersFilter:       "sAMAccountName={input}",
-			GroupsFilter:      "(|{memberof:dn})",
-			AdditionalUsersDN: "CN=users",
-			BaseDN:            "DC=example,DC=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("CN=Administrator,CN=Users,DC=example,DC=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -2906,7 +3420,7 @@ func TestShouldSkipEmptyAttributesSearchModeFilter(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 
@@ -2918,39 +3432,38 @@ func TestShouldSkipEmptyGroupsResultMemberOf(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchGroups := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -2984,7 +3497,7 @@ func TestShouldSkipEmptyGroupsResultMemberOf(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -2998,41 +3511,40 @@ func TestShouldReturnUsernameFromLDAPWithReferralsInErrorAndResult(t *testing.T)
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 	mockClientReferral := NewMockLDAPClient(ctrl)
 	mockClientReferralAlt := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchGroups := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -3045,15 +3557,15 @@ func TestShouldReturnUsernameFromLDAPWithReferralsInErrorAndResult(t *testing.T)
 			Referrals: []string{"ldap://192.168.0.1"},
 		}, &ldap.Error{ResultCode: ldap.LDAPResultReferral, Err: errors.New("referral"), Packet: &testBERPacketReferral})
 
-	dialURLReferral := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(mockClientReferral, nil)
+	dialURLReferral := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(mockClientReferral, nil)
 
-	connBindReferral := mockClientReferral.EXPECT().
+	setTimeoutReferral := mockClientReferral.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindReferral := mockClientReferral.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connCloseReferral := mockClientReferral.EXPECT().Close()
+	clientCloseReferral := mockClientReferral.EXPECT().Close()
 
 	searchProfileReferral := mockClientReferral.EXPECT().
 		Search(gomock.Any()).
@@ -3079,15 +3591,15 @@ func TestShouldReturnUsernameFromLDAPWithReferralsInErrorAndResult(t *testing.T)
 			},
 		}, nil)
 
-	dialURLReferralAlt := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(mockClientReferralAlt, nil)
+	dialURLReferralAlt := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(mockClientReferralAlt, nil)
 
-	connBindReferralAlt := mockClientReferralAlt.EXPECT().
+	setTimeoutReferralAlt := mockClientReferralAlt.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindReferralAlt := mockClientReferralAlt.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connCloseReferralAlt := mockClientReferralAlt.EXPECT().Close()
+	clientCloseReferralAlt := mockClientReferralAlt.EXPECT().Close()
 
 	searchProfileReferralAlt := mockClientReferralAlt.EXPECT().
 		Search(gomock.Any()).
@@ -3113,7 +3625,7 @@ func TestShouldReturnUsernameFromLDAPWithReferralsInErrorAndResult(t *testing.T)
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, dialURLReferral, connBindReferral, searchProfileReferral, connCloseReferral, dialURLReferralAlt, connBindReferralAlt, searchProfileReferralAlt, connCloseReferralAlt, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, dialURLReferral, setTimeoutReferral, clientBindReferral, searchProfileReferral, clientCloseReferral, dialURLReferralAlt, setTimeoutReferralAlt, clientBindReferralAlt, searchProfileReferralAlt, clientCloseReferralAlt, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -3128,40 +3640,39 @@ func TestShouldReturnUsernameFromLDAPWithReferralsInErrorAndNoResult(t *testing.
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 	mockClientReferral := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchGroups := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -3171,15 +3682,15 @@ func TestShouldReturnUsernameFromLDAPWithReferralsInErrorAndNoResult(t *testing.
 		Search(gomock.Any()).
 		Return(nil, &ldap.Error{ResultCode: ldap.LDAPResultReferral, Err: errors.New("referral"), Packet: &testBERPacketReferral})
 
-	dialURLReferral := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(mockClientReferral, nil)
+	dialURLReferral := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(mockClientReferral, nil)
 
-	connBindReferral := mockClientReferral.EXPECT().
+	setTimeoutReferral := mockClientReferral.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindReferral := mockClientReferral.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connCloseReferral := mockClientReferral.EXPECT().Close()
+	clientCloseReferral := mockClientReferral.EXPECT().Close()
 
 	searchProfileReferral := mockClientReferral.EXPECT().
 		Search(gomock.Any()).
@@ -3205,7 +3716,7 @@ func TestShouldReturnUsernameFromLDAPWithReferralsInErrorAndNoResult(t *testing.
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, dialURLReferral, connBindReferral, searchProfileReferral, connCloseReferral, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, dialURLReferral, setTimeoutReferral, clientBindReferral, searchProfileReferral, clientCloseReferral, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -3220,114 +3731,110 @@ func TestShouldReturnDialErrDuringReferralSearchUsernameFromLDAPWithReferralsInE
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
 		Return(nil, &ldap.Error{ResultCode: ldap.LDAPResultReferral, Err: errors.New("referral"), Packet: &testBERPacketReferral})
 
-	dialURLReferral := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(nil, fmt.Errorf("failed to connect"))
+	dialURLReferral := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(nil, fmt.Errorf("failed to connect"))
 
-	gomock.InOrder(dialURL, connBind, searchProfile, dialURLReferral, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, dialURLReferral, clientClose)
 
 	details, err := provider.GetDetails("john")
 
 	assert.Nil(t, details)
-	assert.EqualError(t, err, "cannot find user DN of user 'john'. Cause: error occurred connecting to referred LDAP server 'ldap://192.168.0.1': dial failed with error: failed to connect")
+	assert.EqualError(t, err, "cannot find user DN of user 'john'. Cause: error occurred connecting to referred LDAP server 'ldap://192.168.0.1': error occurred dialing address: failed to connect")
 }
 
 func TestShouldReturnSearchErrDuringReferralSearchUsernameFromLDAPWithReferralsInErrorAndNoResult(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 	mockClientReferral := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
 		Return(nil, &ldap.Error{ResultCode: ldap.LDAPResultReferral, Err: errors.New("referral"), Packet: &testBERPacketReferral})
 
-	dialURLReferral := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(mockClientReferral, nil)
+	dialURLReferral := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(mockClientReferral, nil)
 
-	connBindReferral := mockClientReferral.EXPECT().
+	setTimeoutReferral := mockClientReferral.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindReferral := mockClientReferral.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connCloseReferral := mockClientReferral.EXPECT().Close()
+	clientCloseReferral := mockClientReferral.EXPECT().Close()
 
 	searchProfileReferral := mockClientReferral.EXPECT().
 		Search(gomock.Any()).
 		Return(nil, fmt.Errorf("not found"))
 
-	gomock.InOrder(dialURL, connBind, searchProfile, dialURLReferral, connBindReferral, searchProfileReferral, connCloseReferral, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, dialURLReferral, setTimeoutReferral, clientBindReferral, searchProfileReferral, clientCloseReferral, clientClose)
 
 	details, err := provider.GetDetails("john")
 
@@ -3339,45 +3846,44 @@ func TestShouldNotReturnUsernameFromLDAPWithReferralsInErrorAndReferralsNotPermi
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   false,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   false,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
 		Return(nil, &ldap.Error{ResultCode: ldap.LDAPResultReferral, Err: errors.New("referral"), Packet: &testBERPacketReferral})
 
-	gomock.InOrder(dialURL, connBind, searchProfile, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, clientClose)
 
 	details, err := provider.GetDetails("john")
 	assert.EqualError(t, err, "cannot find user DN of user 'john'. Cause: LDAP Result Code 10 \"Referral\": referral")
@@ -3388,40 +3894,39 @@ func TestShouldReturnUsernameFromLDAPWithReferralsErr(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 	mockClientReferral := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchGroups := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -3431,15 +3936,15 @@ func TestShouldReturnUsernameFromLDAPWithReferralsErr(t *testing.T) {
 		Search(gomock.Any()).
 		Return(&ldap.SearchResult{}, &ldap.Error{ResultCode: ldap.LDAPResultReferral, Err: errors.New("referral"), Packet: &testBERPacketReferral})
 
-	dialURLReferral := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(mockClientReferral, nil)
+	dialURLReferral := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(mockClientReferral, nil)
 
-	connBindReferral := mockClientReferral.EXPECT().
+	setTimeoutReferral := mockClientReferral.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindReferral := mockClientReferral.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connCloseReferral := mockClientReferral.EXPECT().Close()
+	clientCloseReferral := mockClientReferral.EXPECT().Close()
 
 	searchProfileReferral := mockClientReferral.EXPECT().
 		Search(gomock.Any()).
@@ -3465,7 +3970,7 @@ func TestShouldReturnUsernameFromLDAPWithReferralsErr(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connBind, searchProfile, dialURLReferral, connBindReferral, searchProfileReferral, connCloseReferral, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, clientBind, searchProfile, dialURLReferral, setTimeoutReferral, clientBindReferral, searchProfileReferral, clientCloseReferral, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -3480,34 +3985,35 @@ func TestShouldNotUpdateUserPasswordConnect(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   false,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   false,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(nil, errors.New("tcp timeout"))
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
-	connBindOIDs := mockClient.EXPECT().
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -3531,53 +4037,50 @@ func TestShouldNotUpdateUserPasswordConnect(t *testing.T) {
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(nil, errors.New("tcp timeout"))
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL)
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL)
+	require.NoError(t, provider.StartupCheck())
 
-	err := provider.StartupCheck()
-	require.NoError(t, err)
-
-	err = provider.UpdatePassword("john", "password")
-	assert.EqualError(t, err, "unable to update password. Cause: dial failed with error: tcp timeout")
+	assert.EqualError(t, provider.UpdatePassword("john", "password"), "unable to update password. Cause: error occurred dialing address: tcp timeout")
 }
 
 func TestShouldNotUpdateUserPasswordGetDetails(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   false,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   false,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBindOIDs := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -3601,56 +4104,53 @@ func TestShouldNotUpdateUserPasswordGetDetails(t *testing.T) {
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
 		Return(nil, &ldap.Error{ResultCode: ldap.LDAPResultProtocolError, Err: errors.New("permission error")})
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, clientClose)
 
-	err := provider.StartupCheck()
-	require.NoError(t, err)
+	require.NoError(t, provider.StartupCheck())
 
-	err = provider.UpdatePassword("john", "password")
-	assert.EqualError(t, err, "unable to update password. Cause: cannot find user DN of user 'john'. Cause: LDAP Result Code 2 \"Protocol Error\": permission error")
+	assert.EqualError(t, provider.UpdatePassword("john", "password"), "unable to update password. Cause: cannot find user DN of user 'john'. Cause: LDAP Result Code 2 \"Protocol Error\": permission error")
 }
 
 func TestShouldUpdateUserPassword(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	modifyRequest := ldap.NewModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -3659,11 +4159,11 @@ func TestShouldUpdateUserPassword(t *testing.T) {
 
 	modifyRequest.Replace(ldapAttributeUserPassword, []string{"password"})
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -3687,17 +4187,13 @@ func TestShouldUpdateUserPassword(t *testing.T) {
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -3727,7 +4223,7 @@ func TestShouldUpdateUserPassword(t *testing.T) {
 		Modify(modifyRequest).
 		Return(nil)
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, modify, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, modify, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -3740,28 +4236,31 @@ func TestShouldUpdateUserPasswordMSAD(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Implementation: "activedirectory",
+		Address:        testLDAPAddress,
+		User:           "cn=admin,dc=example,dc=com",
+		Password:       "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Implementation: "activedirectory",
-			Address:        testLDAPAddress,
-			User:           "cn=admin,dc=example,dc=com",
-			Password:       "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	modifyRequest := ldap.NewModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -3771,11 +4270,11 @@ func TestShouldUpdateUserPasswordMSAD(t *testing.T) {
 	pwdEncoded, _ := encodingUTF16LittleEndian.NewEncoder().String(fmt.Sprintf("\"%s\"", "password"))
 	modifyRequest.Replace(ldapAttributeUnicodePwd, []string{pwdEncoded})
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -3799,17 +4298,13 @@ func TestShouldUpdateUserPasswordMSAD(t *testing.T) {
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -3839,7 +4334,7 @@ func TestShouldUpdateUserPasswordMSAD(t *testing.T) {
 		Modify(modifyRequest).
 		Return(nil)
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, modify, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, modify, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -3852,30 +4347,33 @@ func TestShouldUpdateUserPasswordMSADWithReferrals(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Implementation: "activedirectory",
+		Address:        testLDAPAddress,
+		User:           "cn=admin,dc=example,dc=com",
+		Password:       "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 	mockClientReferral := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Implementation: "activedirectory",
-			Address:        testLDAPAddress,
-			User:           "cn=admin,dc=example,dc=com",
-			Password:       "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	modifyRequest := ldap.NewModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -3885,11 +4383,11 @@ func TestShouldUpdateUserPasswordMSADWithReferrals(t *testing.T) {
 	pwdEncoded, _ := encodingUTF16LittleEndian.NewEncoder().String(fmt.Sprintf("\"%s\"", "password"))
 	modifyRequest.Replace(ldapAttributeUnicodePwd, []string{pwdEncoded})
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -3913,17 +4411,13 @@ func TestShouldUpdateUserPasswordMSADWithReferrals(t *testing.T) {
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -3957,21 +4451,21 @@ func TestShouldUpdateUserPasswordMSADWithReferrals(t *testing.T) {
 			Packet:     &testBERPacketReferral,
 		})
 
-	dialURLReferral := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(mockClientReferral, nil)
+	dialURLReferral := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(mockClientReferral, nil)
 
-	connBindReferral := mockClientReferral.EXPECT().
+	setTimeoutReferral := mockClientReferral.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindReferral := mockClientReferral.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connCloseReferral := mockClientReferral.EXPECT().Close()
+	clientCloseReferral := mockClientReferral.EXPECT().Close()
 
 	modifyReferral := mockClientReferral.EXPECT().
 		Modify(modifyRequest).
 		Return(nil)
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, modify, dialURLReferral, connBindReferral, modifyReferral, connCloseReferral, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, modify, dialURLReferral, setTimeoutReferral, clientBindReferral, modifyReferral, clientCloseReferral, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -3984,29 +4478,32 @@ func TestShouldUpdateUserPasswordMSADWithReferralsWithReferralConnectErr(t *test
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Implementation: "activedirectory",
+		Address:        testLDAPAddress,
+		User:           "cn=admin,dc=example,dc=com",
+		Password:       "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Implementation: "activedirectory",
-			Address:        testLDAPAddress,
-			User:           "cn=admin,dc=example,dc=com",
-			Password:       "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	modifyRequest := ldap.NewModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -4016,11 +4513,11 @@ func TestShouldUpdateUserPasswordMSADWithReferralsWithReferralConnectErr(t *test
 	pwdEncoded, _ := encodingUTF16LittleEndian.NewEncoder().String(fmt.Sprintf("\"%s\"", "password"))
 	modifyRequest.Replace(ldapAttributeUnicodePwd, []string{pwdEncoded})
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -4044,17 +4541,13 @@ func TestShouldUpdateUserPasswordMSADWithReferralsWithReferralConnectErr(t *test
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -4088,47 +4581,48 @@ func TestShouldUpdateUserPasswordMSADWithReferralsWithReferralConnectErr(t *test
 			Packet:     &testBERPacketReferral,
 		})
 
-	dialURLReferral := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(nil, errors.New("tcp timeout"))
+	dialURLReferral := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(nil, errors.New("tcp timeout"))
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, modify, dialURLReferral, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, modify, dialURLReferral, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
 
 	err = provider.UpdatePassword("john", "password")
-	assert.EqualError(t, err, "unable to update password. Cause: error occurred connecting to referred LDAP server 'ldap://192.168.0.1': dial failed with error: tcp timeout. Original Error: LDAP Result Code 10 \"Referral\": error occurred")
+	assert.EqualError(t, err, "unable to update password. Cause: error occurred connecting to referred LDAP server 'ldap://192.168.0.1': error occurred dialing address: tcp timeout. Original Error: LDAP Result Code 10 \"Referral\": error occurred")
 }
 
 func TestShouldUpdateUserPasswordMSADWithReferralsWithReferralModifyErr(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Implementation: "activedirectory",
+		Address:        testLDAPAddress,
+		User:           "cn=admin,dc=example,dc=com",
+		Password:       "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 	mockClientReferral := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Implementation: "activedirectory",
-			Address:        testLDAPAddress,
-			User:           "cn=admin,dc=example,dc=com",
-			Password:       "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	modifyRequest := ldap.NewModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -4138,11 +4632,11 @@ func TestShouldUpdateUserPasswordMSADWithReferralsWithReferralModifyErr(t *testi
 	pwdEncoded, _ := encodingUTF16LittleEndian.NewEncoder().String(fmt.Sprintf("\"%s\"", "password"))
 	modifyRequest.Replace(ldapAttributeUnicodePwd, []string{pwdEncoded})
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -4166,17 +4660,13 @@ func TestShouldUpdateUserPasswordMSADWithReferralsWithReferralModifyErr(t *testi
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -4210,15 +4700,15 @@ func TestShouldUpdateUserPasswordMSADWithReferralsWithReferralModifyErr(t *testi
 			Packet:     &testBERPacketReferral,
 		})
 
-	dialURLReferral := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(mockClientReferral, nil)
+	dialURLReferral := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(mockClientReferral, nil)
 
-	connBindReferral := mockClientReferral.EXPECT().
+	setTimeoutReferral := mockClientReferral.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindReferral := mockClientReferral.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connCloseReferral := mockClientReferral.EXPECT().Close()
+	clientCloseReferral := mockClientReferral.EXPECT().Close()
 
 	modifyReferral := mockClientReferral.EXPECT().
 		Modify(modifyRequest).
@@ -4228,7 +4718,7 @@ func TestShouldUpdateUserPasswordMSADWithReferralsWithReferralModifyErr(t *testi
 			Packet:     &testBERPacketReferral,
 		})
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, modify, dialURLReferral, connBindReferral, modifyReferral, connCloseReferral, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, modify, dialURLReferral, setTimeoutReferral, clientBindReferral, modifyReferral, clientCloseReferral, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -4241,29 +4731,32 @@ func TestShouldUpdateUserPasswordMSADWithoutReferrals(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Implementation: "activedirectory",
+		Address:        testLDAPAddress,
+		User:           "cn=admin,dc=example,dc=com",
+		Password:       "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   false,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Implementation: "activedirectory",
-			Address:        testLDAPAddress,
-			User:           "cn=admin,dc=example,dc=com",
-			Password:       "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   false,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	modifyRequest := ldap.NewModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -4273,11 +4766,11 @@ func TestShouldUpdateUserPasswordMSADWithoutReferrals(t *testing.T) {
 	pwdEncoded, _ := encodingUTF16LittleEndian.NewEncoder().String(fmt.Sprintf("\"%s\"", "password"))
 	modifyRequest.Replace(ldapAttributeUnicodePwd, []string{pwdEncoded})
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -4301,17 +4794,13 @@ func TestShouldUpdateUserPasswordMSADWithoutReferrals(t *testing.T) {
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -4345,7 +4834,7 @@ func TestShouldUpdateUserPasswordMSADWithoutReferrals(t *testing.T) {
 			Packet:     &testBERPacketReferral,
 		})
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, modify, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, modify, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -4358,27 +4847,30 @@ func TestShouldUpdateUserPasswordPasswdModifyExtension(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	pwdModifyRequest := ldap.NewPasswordModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -4386,11 +4878,11 @@ func TestShouldUpdateUserPasswordPasswdModifyExtension(t *testing.T) {
 		"password",
 	)
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -4414,17 +4906,13 @@ func TestShouldUpdateUserPasswordPasswdModifyExtension(t *testing.T) {
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -4454,7 +4942,7 @@ func TestShouldUpdateUserPasswordPasswdModifyExtension(t *testing.T) {
 		PasswordModify(pwdModifyRequest).
 		Return(nil, nil)
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, passwdModify, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, passwdModify, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -4467,29 +4955,32 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferrals(t *testing.T
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 	mockClientReferral := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	pwdModifyRequest := ldap.NewPasswordModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -4497,11 +4988,11 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferrals(t *testing.T
 		"password",
 	)
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -4525,17 +5016,13 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferrals(t *testing.T
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -4571,21 +5058,21 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferrals(t *testing.T
 			Packet:     &testBERPacketReferral,
 		})
 
-	dialURLReferral := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(mockClientReferral, nil)
+	dialURLReferral := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(mockClientReferral, nil)
 
-	connBindReferral := mockClientReferral.EXPECT().
+	setTimeoutReferral := mockClientReferral.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindReferral := mockClientReferral.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connCloseReferral := mockClientReferral.EXPECT().Close()
+	clientCloseReferral := mockClientReferral.EXPECT().Close()
 
 	passwdModifyReferral := mockClientReferral.EXPECT().
 		PasswordModify(pwdModifyRequest).
 		Return(&ldap.PasswordModifyResult{}, nil)
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, passwdModify, dialURLReferral, connBindReferral, passwdModifyReferral, connCloseReferral, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, passwdModify, dialURLReferral, setTimeoutReferral, clientBindReferral, passwdModifyReferral, clientCloseReferral, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -4598,28 +5085,31 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithoutReferrals(t *testin
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   false,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   false,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	pwdModifyRequest := ldap.NewPasswordModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -4627,11 +5117,11 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithoutReferrals(t *testin
 		"password",
 	)
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -4655,17 +5145,13 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithoutReferrals(t *testin
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -4701,7 +5187,7 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithoutReferrals(t *testin
 			Packet:     &testBERPacketReferral,
 		})
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, passwdModify, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, passwdModify, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -4714,28 +5200,31 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferralsReferralConne
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	pwdModifyRequest := ldap.NewPasswordModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -4743,11 +5232,11 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferralsReferralConne
 		"password",
 	)
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -4771,17 +5260,13 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferralsReferralConne
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -4817,46 +5302,47 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferralsReferralConne
 			Packet:     &testBERPacketReferral,
 		})
 
-	dialURLReferral := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(nil, errors.New("tcp timeout"))
+	dialURLReferral := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(nil, errors.New("tcp timeout"))
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, passwdModify, dialURLReferral, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, passwdModify, dialURLReferral, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
 
 	err = provider.UpdatePassword("john", "password")
-	assert.EqualError(t, err, "unable to update password. Cause: error occurred connecting to referred LDAP server 'ldap://192.168.0.1': dial failed with error: tcp timeout. Original Error: LDAP Result Code 10 \"Referral\": error occurred")
+	assert.EqualError(t, err, "unable to update password. Cause: error occurred connecting to referred LDAP server 'ldap://192.168.0.1': error occurred dialing address: tcp timeout. Original Error: LDAP Result Code 10 \"Referral\": error occurred")
 }
 
 func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferralsReferralPasswordModifyErr(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		PermitReferrals:   true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 	mockClientReferral := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			PermitReferrals:   true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	pwdModifyRequest := ldap.NewPasswordModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -4864,11 +5350,11 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferralsReferralPassw
 		"password",
 	)
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -4892,17 +5378,13 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferralsReferralPassw
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -4938,15 +5420,15 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferralsReferralPassw
 			Packet:     &testBERPacketReferral,
 		})
 
-	dialURLReferral := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://192.168.0.1"), gomock.Any()).
-		Return(mockClientReferral, nil)
+	dialURLReferral := mockDialer.EXPECT().DialURL("ldap://192.168.0.1", gomock.Any()).Return(mockClientReferral, nil)
 
-	connBindReferral := mockClientReferral.EXPECT().
+	setTimeoutReferral := mockClientReferral.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindReferral := mockClientReferral.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connCloseReferral := mockClientReferral.EXPECT().Close()
+	clientCloseReferral := mockClientReferral.EXPECT().Close()
 
 	passwdModifyReferral := mockClientReferral.EXPECT().
 		PasswordModify(pwdModifyRequest).
@@ -4956,7 +5438,7 @@ func TestShouldUpdateUserPasswordPasswdModifyExtensionWithReferralsReferralPassw
 			Packet:     &testBERPacketReferral,
 		})
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, passwdModify, dialURLReferral, connBindReferral, passwdModifyReferral, connCloseReferral, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, passwdModify, dialURLReferral, setTimeoutReferral, clientBindReferral, passwdModifyReferral, clientCloseReferral, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -4969,29 +5451,32 @@ func TestShouldUpdateUserPasswordActiveDirectoryWithServerPolicyHints(t *testing
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Implementation: "activedirectory",
+		Address:        testLDAPAddress,
+		User:           "cn=admin,dc=example,dc=com",
+		Password:       "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			DistinguishedName: "distinguishedName",
+			Username:          "sAMAccountName",
+			Mail:              "mail",
+			DisplayName:       "displayName",
+			MemberOf:          "memberOf",
+		},
+		UsersFilter:       "cn={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Implementation: "activedirectory",
-			Address:        testLDAPAddress,
-			User:           "cn=admin,dc=example,dc=com",
-			Password:       "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				DistinguishedName: "distinguishedName",
-				Username:          "sAMAccountName",
-				Mail:              "mail",
-				DisplayName:       "displayName",
-				MemberOf:          "memberOf",
-			},
-			UsersFilter:       "cn={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	utf16 := unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM)
 	pwdEncoded, _ := utf16.NewEncoder().String("\"password\"")
@@ -5003,11 +5488,11 @@ func TestShouldUpdateUserPasswordActiveDirectoryWithServerPolicyHints(t *testing
 
 	modifyRequest.Replace("unicodePwd", []string{pwdEncoded})
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -5031,17 +5516,13 @@ func TestShouldUpdateUserPasswordActiveDirectoryWithServerPolicyHints(t *testing
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -5071,7 +5552,7 @@ func TestShouldUpdateUserPasswordActiveDirectoryWithServerPolicyHints(t *testing
 		Modify(modifyRequest).
 		Return(nil)
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, passwdModify, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, passwdModify, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -5084,29 +5565,32 @@ func TestShouldUpdateUserPasswordActiveDirectoryWithServerPolicyHintsDeprecated(
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Implementation: "activedirectory",
+		Address:        testLDAPAddress,
+		User:           "cn=admin,dc=example,dc=com",
+		Password:       "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			DistinguishedName: "distinguishedName",
+			Username:          "sAMAccountName",
+			Mail:              "mail",
+			DisplayName:       "displayName",
+			MemberOf:          "memberOf",
+		},
+		UsersFilter:       "cn={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Implementation: "activedirectory",
-			Address:        testLDAPAddress,
-			User:           "cn=admin,dc=example,dc=com",
-			Password:       "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				DistinguishedName: "distinguishedName",
-				Username:          "sAMAccountName",
-				Mail:              "mail",
-				DisplayName:       "displayName",
-				MemberOf:          "memberOf",
-			},
-			UsersFilter:       "cn={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	utf16 := unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM)
 	pwdEncoded, _ := utf16.NewEncoder().String("\"password\"")
@@ -5118,11 +5602,11 @@ func TestShouldUpdateUserPasswordActiveDirectoryWithServerPolicyHintsDeprecated(
 
 	modifyRequest.Replace("unicodePwd", []string{pwdEncoded})
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -5146,17 +5630,13 @@ func TestShouldUpdateUserPasswordActiveDirectoryWithServerPolicyHintsDeprecated(
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -5186,7 +5666,7 @@ func TestShouldUpdateUserPasswordActiveDirectoryWithServerPolicyHintsDeprecated(
 		Modify(modifyRequest).
 		Return(nil)
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, passwdModify, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, passwdModify, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -5199,29 +5679,32 @@ func TestShouldUpdateUserPasswordActiveDirectory(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Implementation: "activedirectory",
+		Address:        testLDAPAddress,
+		User:           "cn=admin,dc=example,dc=com",
+		Password:       "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			DistinguishedName: "distinguishedName",
+			Username:          "sAMAccountName",
+			Mail:              "mail",
+			DisplayName:       "displayName",
+			MemberOf:          "memberOf",
+		},
+		UsersFilter:       "cn={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Implementation: "activedirectory",
-			Address:        testLDAPAddress,
-			User:           "cn=admin,dc=example,dc=com",
-			Password:       "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				DistinguishedName: "distinguishedName",
-				Username:          "sAMAccountName",
-				Mail:              "mail",
-				DisplayName:       "displayName",
-				MemberOf:          "memberOf",
-			},
-			UsersFilter:       "cn={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	utf16 := unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM)
 	pwdEncoded, _ := utf16.NewEncoder().String("\"password\"")
@@ -5233,11 +5716,11 @@ func TestShouldUpdateUserPasswordActiveDirectory(t *testing.T) {
 
 	modifyRequest.Replace("unicodePwd", []string{pwdEncoded})
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -5261,17 +5744,13 @@ func TestShouldUpdateUserPasswordActiveDirectory(t *testing.T) {
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -5301,7 +5780,7 @@ func TestShouldUpdateUserPasswordActiveDirectory(t *testing.T) {
 		Modify(modifyRequest).
 		Return(nil)
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, passwdModify, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, passwdModify, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -5314,28 +5793,31 @@ func TestShouldUpdateUserPasswordBasic(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Implementation: "custom",
+		Address:        testLDAPAddress,
+		User:           "uid=admin,dc=example,dc=com",
+		Password:       "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Implementation: "custom",
-			Address:        testLDAPAddress,
-			User:           "uid=admin,dc=example,dc=com",
-			Password:       "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
+
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	modifyRequest := ldap.NewModifyRequest(
 		"uid=test,dc=example,dc=com",
@@ -5344,11 +5826,11 @@ func TestShouldUpdateUserPasswordBasic(t *testing.T) {
 
 	modifyRequest.Replace("userPassword", []string{"password"})
 
-	dialURLOIDs := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURLOIDs := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBindOIDs := mockClient.EXPECT().
+	setTimeoutOIDs := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBindOIDs := mockClient.EXPECT().
 		Bind(gomock.Eq("uid=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -5372,17 +5854,13 @@ func TestShouldUpdateUserPasswordBasic(t *testing.T) {
 			},
 		}, nil)
 
-	connCloseOIDs := mockClient.EXPECT().Close()
+	clientCloseOIDs := mockClient.EXPECT().Close()
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
-
-	connBind := mockClient.EXPECT().
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("uid=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchProfile := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -5412,7 +5890,7 @@ func TestShouldUpdateUserPasswordBasic(t *testing.T) {
 		Modify(modifyRequest).
 		Return(nil)
 
-	gomock.InOrder(dialURLOIDs, connBindOIDs, searchOIDs, connCloseOIDs, dialURL, connBind, searchProfile, passwdModify, connClose)
+	gomock.InOrder(dialURLOIDs, setTimeoutOIDs, clientBindOIDs, searchOIDs, clientCloseOIDs, dialURL, setTimeout, clientBind, searchProfile, passwdModify, clientClose)
 
 	err := provider.StartupCheck()
 	require.NoError(t, err)
@@ -5425,33 +5903,32 @@ func TestShouldReturnErrorWhenMultipleUsernameAttributes(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	bind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -5479,9 +5956,9 @@ func TestShouldReturnErrorWhenMultipleUsernameAttributes(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, bind, search)
+	gomock.InOrder(dialURL, setTimeout, clientBind, search)
 
-	client, err := provider.connect()
+	client, err := provider.factory.GetClient()
 	assert.NoError(t, err)
 
 	profile, err := provider.getUserProfile(client, "john")
@@ -5494,33 +5971,32 @@ func TestShouldReturnErrorWhenZeroUsernameAttributes(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	bind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -5548,9 +6024,9 @@ func TestShouldReturnErrorWhenZeroUsernameAttributes(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, bind, search)
+	gomock.InOrder(dialURL, setTimeout, clientBind, search)
 
-	client, err := provider.connect()
+	client, err := provider.factory.GetClient()
 	assert.NoError(t, err)
 
 	profile, err := provider.getUserProfile(client, "john")
@@ -5563,33 +6039,32 @@ func TestShouldReturnErrorWhenUsernameAttributeNotReturned(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	bind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -5613,9 +6088,9 @@ func TestShouldReturnErrorWhenUsernameAttributeNotReturned(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, bind, search)
+	gomock.InOrder(dialURL, setTimeout, clientBind, search)
 
-	client, err := provider.connect()
+	client, err := provider.factory.GetClient()
 	assert.NoError(t, err)
 
 	profile, err := provider.getUserProfile(client, "john")
@@ -5628,33 +6103,32 @@ func TestShouldReturnErrorWhenMultipleUsersFound(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "(|(uid={input})(uid=*))",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "(|(uid={input})(uid=*))",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	bind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -5699,9 +6173,9 @@ func TestShouldReturnErrorWhenMultipleUsersFound(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, bind, search)
+	gomock.InOrder(dialURL, setTimeout, clientBind, search)
 
-	client, err := provider.connect()
+	client, err := provider.factory.GetClient()
 	assert.NoError(t, err)
 
 	profile, err := provider.getUserProfile(client, "john")
@@ -5714,33 +6188,32 @@ func TestShouldReturnErrorWhenNoDN(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "(|(uid={input})(uid=*))",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "(|(uid={input})(uid=*))",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	bind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
@@ -5768,9 +6241,9 @@ func TestShouldReturnErrorWhenNoDN(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, bind, search)
+	gomock.InOrder(dialURL, setTimeout, clientBind, search)
 
-	client, err := provider.connect()
+	client, err := provider.factory.GetClient()
 	assert.NoError(t, err)
 
 	profile, err := provider.getUserProfile(client, "john")
@@ -5783,32 +6256,30 @@ func TestShouldCheckValidUserPassword(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	gomock.InOrder(
-		mockFactory.EXPECT().
-			DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-			Return(mockClient, nil),
+		mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil),
+		mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second*0)),
 		mockClient.EXPECT().
 			Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 			Return(nil),
@@ -5835,9 +6306,8 @@ func TestShouldCheckValidUserPassword(t *testing.T) {
 					},
 				},
 			}, nil),
-		mockFactory.EXPECT().
-			DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-			Return(mockClient, nil),
+		mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil),
+		mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second*0)),
 		mockClient.EXPECT().
 			Bind(gomock.Eq("uid=test,dc=example,dc=com"), gomock.Eq("password")).
 			Return(nil),
@@ -5854,74 +6324,71 @@ func TestShouldNotCheckValidUserPasswordWithConnectError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	bind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(&ldap.Error{ResultCode: ldap.LDAPResultInvalidCredentials, Err: errors.New("invalid username or password")})
 
-	gomock.InOrder(dialURL, bind, mockClient.EXPECT().Close())
+	gomock.InOrder(dialURL, setTimeout, clientBind, mockClient.EXPECT().Close())
 
 	valid, err := provider.CheckUserPassword("john", "password")
 
 	assert.False(t, valid)
-	assert.EqualError(t, err, "bind failed with error: LDAP Result Code 49 \"Invalid Credentials\": invalid username or password")
+	assert.EqualError(t, err, "error occurred performing bind: LDAP Result Code 49 \"Invalid Credentials\": invalid username or password")
 }
 
 func TestShouldNotCheckValidUserPasswordWithGetProfileError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	gomock.InOrder(
-		mockFactory.EXPECT().
-			DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-			Return(mockClient, nil),
+		mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil),
+		mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second*0)),
 		mockClient.EXPECT().
 			Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 			Return(nil),
@@ -5941,32 +6408,30 @@ func TestShouldCheckInvalidUserPassword(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-		},
-		false,
-		nil,
-		mockFactory)
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	gomock.InOrder(
-		mockFactory.EXPECT().
-			DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-			Return(mockClient, nil),
+		mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil),
+		mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second*0)),
 		mockClient.EXPECT().
 			Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 			Return(nil),
@@ -5993,9 +6458,8 @@ func TestShouldCheckInvalidUserPassword(t *testing.T) {
 					},
 				},
 			}, nil),
-		mockFactory.EXPECT().
-			DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-			Return(mockClient, nil),
+		mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil),
+		mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second*0)),
 		mockClient.EXPECT().
 			Bind(gomock.Eq("uid=test,dc=example,dc=com"), gomock.Eq("password")).
 			Return(errors.New("invalid username or password")),
@@ -6005,49 +6469,49 @@ func TestShouldCheckInvalidUserPassword(t *testing.T) {
 	valid, err := provider.CheckUserPassword("john", "password")
 
 	assert.False(t, valid)
-	require.EqualError(t, err, "authentication failed. Cause: bind failed with error: invalid username or password")
+	require.EqualError(t, err, "authentication failed. Cause: error occurred performing bind: invalid username or password")
 }
 
 func TestShouldCallStartTLSWhenEnabled(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		TLS:               schema.DefaultLDAPAuthenticationBackendConfigurationImplementationCustom.TLS,
+		StartTLS:          true,
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			StartTLS:          true,
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
 
-	connBind := mockClient.EXPECT().
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	connStartTLS := mockClient.EXPECT().
+		StartTLS(gomock.Any())
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
-	connStartTLS := mockClient.EXPECT().
-		StartTLS(provider.tlsConfig)
-
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchGroups := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -6077,7 +6541,7 @@ func TestShouldCallStartTLSWhenEnabled(t *testing.T) {
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connStartTLS, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, connStartTLS, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -6095,7 +6559,7 @@ func TestShouldParseDynamicConfiguration(t *testing.T) {
 	mockFactory := NewMockLDAPClientFactory(ctrl)
 
 	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
+		&schema.AuthenticationBackendLDAP{
 			Address:  testLDAPAddress,
 			User:     "cn=admin,dc=example,dc=com",
 			Password: "password",
@@ -6113,7 +6577,6 @@ func TestShouldParseDynamicConfiguration(t *testing.T) {
 			StartTLS:           true,
 		},
 		false,
-		nil,
 		mockFactory)
 
 	provider.clock = clock.NewFixed(time.Unix(1670250519, 0))
@@ -6139,49 +6602,48 @@ func TestShouldCallStartTLSWithInsecureSkipVerifyWhenSkipVerifyTrue(t *testing.T
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+			GroupName:   "cn",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		StartTLS:          true,
+		TLS: &schema.TLS{
+			SkipVerify: true,
+		},
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-				GroupName:   "cn",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			StartTLS:          true,
-			TLS: &schema.TLS{
-				SkipVerify: true,
-			},
-		},
-		false,
-		nil,
-		mockFactory)
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	assert.False(t, provider.groupsFilterReplacementInput)
 	assert.False(t, provider.groupsFilterReplacementUsername)
 	assert.False(t, provider.groupsFilterReplacementDN)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldap://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	dialURL := mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	connBind := mockClient.EXPECT().
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	clientBind := mockClient.EXPECT().
 		Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
 		Return(nil)
 
 	connStartTLS := mockClient.EXPECT().
-		StartTLS(provider.tlsConfig)
+		StartTLS(gomock.Not(gomock.Nil()))
 
-	connClose := mockClient.EXPECT().Close()
+	clientClose := mockClient.EXPECT().Close()
 
 	searchGroups := mockClient.EXPECT().
 		Search(gomock.Any()).
@@ -6215,7 +6677,7 @@ func TestShouldCallStartTLSWithInsecureSkipVerifyWhenSkipVerifyTrue(t *testing.T
 			},
 		}, nil)
 
-	gomock.InOrder(dialURL, connStartTLS, connBind, searchProfile, searchGroups, connClose)
+	gomock.InOrder(dialURL, setTimeout, connStartTLS, clientBind, searchProfile, searchGroups, clientClose)
 
 	details, err := provider.GetDetails("john")
 	require.NoError(t, err)
@@ -6230,42 +6692,304 @@ func TestShouldReturnLDAPSAlreadySecuredWhenStartTLSAttempted(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockFactory := NewMockLDAPClientFactory(ctrl)
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPSAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "uid={input}",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+		StartTLS:          true,
+		TLS: &schema.TLS{
+			SkipVerify: true,
+		},
+	}
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+
 	mockClient := NewMockLDAPClient(ctrl)
 
-	provider := NewLDAPUserProviderWithFactory(
-		schema.AuthenticationBackendLDAP{
-			Address:  testLDAPSAddress,
-			User:     "cn=admin,dc=example,dc=com",
-			Password: "password",
-			Attributes: schema.AuthenticationBackendLDAPAttributes{
-				Username:    "uid",
-				Mail:        "mail",
-				DisplayName: "displayName",
-				MemberOf:    "memberOf",
-			},
-			UsersFilter:       "uid={input}",
-			AdditionalUsersDN: "ou=users",
-			BaseDN:            "dc=example,dc=com",
-			StartTLS:          true,
-			TLS: &schema.TLS{
-				SkipVerify: true,
-			},
-		},
-		false,
-		nil,
-		mockFactory)
+	dialURL := mockDialer.EXPECT().DialURL("ldaps://127.0.0.1:389", gomock.Any()).Return(mockClient, nil)
 
-	dialURL := mockFactory.EXPECT().
-		DialURL(gomock.Eq("ldaps://127.0.0.1:389"), gomock.Any()).
-		Return(mockClient, nil)
+	setTimeout := mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
 
 	connStartTLS := mockClient.EXPECT().
-		StartTLS(provider.tlsConfig).
+		StartTLS(gomock.Not(gomock.Nil())).
 		Return(errors.New("LDAP Result Code 200 \"Network Error\": ldap: already encrypted"))
 
-	gomock.InOrder(dialURL, connStartTLS, mockClient.EXPECT().Close())
+	gomock.InOrder(dialURL, setTimeout, connStartTLS, mockClient.EXPECT().Close())
 
 	_, err := provider.GetDetails("john")
-	assert.EqualError(t, err, "starttls failed with error: LDAP Result Code 200 \"Network Error\": ldap: already encrypted")
+	assert.EqualError(t, err, "error occurred performing starttls: LDAP Result Code 200 \"Network Error\": ldap: already encrypted")
+}
+
+func TestLDAPUserProviderChangePasswordErrors(t *testing.T) {
+	testCases := []struct {
+		name            string
+		setupMocks      func(ctrl *gomock.Controller) (*MockLDAPClientDialer, *MockLDAPClient)
+		username        string
+		oldPassword     string
+		newPassword     string
+		expectedError   error
+		expectedLogMsg  string
+		expectedLogType logrus.Level
+	}{
+		{
+			name: "ShouldFailWhenClientError",
+			setupMocks: func(ctrl *gomock.Controller) (*MockLDAPClientDialer, *MockLDAPClient) {
+				mockDialer := NewMockLDAPClientDialer(ctrl)
+				mockClient := NewMockLDAPClient(ctrl)
+
+				mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).
+					Return(nil, errors.New("connection error"))
+
+				return mockDialer, mockClient
+			},
+			username:        "john",
+			oldPassword:     "oldpass",
+			newPassword:     "newpass",
+			expectedError:   fmt.Errorf("unable to update password for user 'john'. Cause: error occurred dialing address: connection error"),
+			expectedLogMsg:  "",
+			expectedLogType: 0,
+		},
+		{
+			name: "ShouldFailWhenGetUserProfileError",
+			setupMocks: func(ctrl *gomock.Controller) (*MockLDAPClientDialer, *MockLDAPClient) {
+				mockDialer := NewMockLDAPClientDialer(ctrl)
+				mockClient := NewMockLDAPClient(ctrl)
+
+				mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).
+					Return(mockClient, nil)
+
+				mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+				mockClient.EXPECT().
+					Bind(gomock.Eq("cn=admin,dc=example,dc=com"), gomock.Eq("password")).
+					Return(nil)
+
+				mockClient.EXPECT().
+					Search(gomock.Any()).
+					Return(nil, errors.New("search error"))
+
+				mockClient.EXPECT().Close()
+
+				return mockDialer, mockClient
+			},
+			username:        "john",
+			oldPassword:     "oldpass",
+			newPassword:     "newpass",
+			expectedError:   fmt.Errorf("unable to update password for user 'john'. Cause: cannot find user DN of user 'john'. Cause: search error"),
+			expectedLogMsg:  "",
+			expectedLogType: 0,
+		},
+		{
+			name: "ShouldFailWithInvalidCredentials",
+			setupMocks: func(ctrl *gomock.Controller) (*MockLDAPClientDialer, *MockLDAPClient) {
+				mockDialer := NewMockLDAPClientDialer(ctrl)
+				mockClient := NewMockLDAPClient(ctrl)
+
+				mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).
+					Return(mockClient, nil)
+
+				mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+				mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).
+					Return(mockClient, nil)
+
+				mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+				mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).
+					Return(mockClient, nil)
+
+				mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0))
+
+				mockClient.EXPECT().Bind("cn=admin,dc=example,dc=com", "password").
+					Return(nil)
+
+				mockClient.EXPECT().Bind("cn=admin,dc=example,dc=com", "password").
+					Return(nil)
+
+				mockClient.EXPECT().Search(gomock.Any()).
+					Return(&ldap.SearchResult{
+						Entries: []*ldap.Entry{
+							{
+								DN: "uid=john,ou=users,dc=example,dc=com",
+								Attributes: []*ldap.EntryAttribute{
+									{
+										Name:   "uid",
+										Values: []string{"john"},
+									},
+								},
+							},
+						},
+					}, nil)
+
+				mockClient.EXPECT().Search(gomock.Any()).
+					Return(&ldap.SearchResult{
+						Entries: []*ldap.Entry{
+							{
+								DN: "uid=john,ou=users,dc=example,dc=com",
+								Attributes: []*ldap.EntryAttribute{
+									{
+										Name:   "uid",
+										Values: []string{"john"},
+									},
+								},
+							},
+						},
+					}, nil)
+
+				mockClient.EXPECT().Bind("uid=john,ou=users,dc=example,dc=com", "oldpass").
+					Return(ldap.NewError(ldap.LDAPResultInvalidCredentials, errors.New("invalid credentials")))
+
+				mockClient.EXPECT().Close().Times(3)
+
+				return mockDialer, mockClient
+			},
+			username:        "john",
+			oldPassword:     "oldpass",
+			newPassword:     "newpass",
+			expectedError:   ErrIncorrectPassword,
+			expectedLogMsg:  "",
+			expectedLogType: 0,
+		},
+		{
+			name: "ShouldFailWhenSamePassword",
+			setupMocks: func(ctrl *gomock.Controller) (*MockLDAPClientDialer, *MockLDAPClient) {
+				mockDialer := NewMockLDAPClientDialer(ctrl)
+				mockClient := NewMockLDAPClient(ctrl)
+
+				mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).
+					Return(mockClient, nil).Times(3)
+
+				mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0)).Times(3)
+
+				mockClient.EXPECT().Bind("cn=admin,dc=example,dc=com", "password").
+					Return(nil).Times(2)
+
+				mockClient.EXPECT().Search(gomock.Any()).
+					Return(&ldap.SearchResult{
+						Entries: []*ldap.Entry{
+							{
+								DN: "uid=john,ou=users,dc=example,dc=com",
+								Attributes: []*ldap.EntryAttribute{
+									{Name: "uid", Values: []string{"john"}},
+								},
+							},
+						},
+					}, nil).Times(2)
+
+				mockClient.EXPECT().Bind("uid=john,ou=users,dc=example,dc=com", "samepass").
+					Return(nil)
+
+				mockClient.EXPECT().Close().Times(3)
+
+				return mockDialer, mockClient
+			},
+			username:        "john",
+			oldPassword:     "samepass",
+			newPassword:     "samepass",
+			expectedError:   ErrPasswordWeak,
+			expectedLogMsg:  "",
+			expectedLogType: 0,
+		},
+		{
+			name: "ShouldFailOnModifyError",
+			setupMocks: func(ctrl *gomock.Controller) (*MockLDAPClientDialer, *MockLDAPClient) {
+				mockDialer := NewMockLDAPClientDialer(ctrl)
+				mockClient := NewMockLDAPClient(ctrl)
+
+				mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).
+					Return(mockClient, nil).Times(3)
+
+				mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0)).Times(3)
+
+				mockClient.EXPECT().Bind("cn=admin,dc=example,dc=com", "password").
+					Return(nil).Times(2)
+
+				mockClient.EXPECT().Search(gomock.Any()).
+					Return(&ldap.SearchResult{
+						Entries: []*ldap.Entry{
+							{
+								DN: "uid=john,ou=users,dc=example,dc=com",
+								Attributes: []*ldap.EntryAttribute{
+									{Name: "uid", Values: []string{"john"}},
+								},
+							},
+						},
+					}, nil).Times(2)
+
+				mockClient.EXPECT().Bind("uid=john,ou=users,dc=example,dc=com", "oldpass").
+					Return(nil)
+
+				mockClient.EXPECT().Modify(gomock.Any()).
+					Return(ldap.NewError(ldap.LDAPResultConstraintViolation, errors.New("password too weak")))
+
+				mockClient.EXPECT().Close().Times(3)
+
+				return mockDialer, mockClient
+			},
+			username:        "john",
+			oldPassword:     "oldpass",
+			newPassword:     "newpass",
+			expectedError:   fmt.Errorf("your supplied password does not meet the password policy requirements: LDAP Result Code 19 \"Constraint Violation\": password too weak"),
+			expectedLogMsg:  "",
+			expectedLogType: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			// can't use mocks package due to circular import (mocks -> authentication, authentication(test) -> mocks).
+			logger := logrus.New()
+			hook := test.NewLocal(logger)
+			logger.SetLevel(logrus.TraceLevel)
+
+			mockDialer, _ := tc.setupMocks(ctrl)
+
+			config := &schema.AuthenticationBackendLDAP{
+				Address:  testLDAPAddress,
+				User:     "cn=admin,dc=example,dc=com",
+				Password: "password",
+				Attributes: schema.AuthenticationBackendLDAPAttributes{
+					Username:    "uid",
+					Mail:        "mail",
+					DisplayName: "displayName",
+					MemberOf:    "memberOf",
+				},
+				UsersFilter:       "uid={input}",
+				AdditionalUsersDN: "ou=users",
+				BaseDN:            "dc=example,dc=com",
+			}
+
+			provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+			err := provider.ChangePassword(tc.username, tc.oldPassword, tc.newPassword)
+
+			if tc.expectedError != nil {
+				assert.Error(t, err)
+				assert.Equal(t, tc.expectedError.Error(), err.Error())
+			} else {
+				assert.NoError(t, err)
+			}
+
+			if tc.expectedLogMsg != "" {
+				entry := hook.LastEntry()
+				require.NotNil(t, entry)
+				assert.Equal(t, tc.expectedLogType, logger.Level)
+				assert.Contains(t, entry.Message, tc.expectedLogMsg)
+			}
+		})
+	}
 }
